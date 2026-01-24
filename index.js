@@ -23,12 +23,12 @@ app.use(cors());
 app.use(express.json());
 
 // ===============================
-// DATABASE CONNECTION (RAILWAY)
+// DATABASE (RAILWAY)
 // ===============================
 const db = mysql.createPool(process.env.MYSQL_URL);
 
 // ===============================
-// UPLOADS SETUP (TEMP - RAILWAY FS)
+// UPLOADS (TEMP FILESYSTEM)
 // ===============================
 const uploadDir = path.join(__dirname, "uploads");
 if (!fs.existsSync(uploadDir)) {
@@ -64,22 +64,81 @@ function requireAuth(req, res, next) {
 }
 
 // ===============================
-// HEALTH (REQUIRED FOR RAILWAY)
+// HEALTH CHECK
 // ===============================
 app.get("/", (req, res) => {
   res.status(200).json({ message: "Delivery API running" });
 });
 
 // ===============================
-// LOGIN (SAFE GET)
-// ===============================
-app.get("/login", (req, res) => {
-  res.status(405).json({ message: "Use POST /login" });
-});
-
-// ===============================
-// LOGIN (POST)
+// LOGIN
 // ===============================
 app.post("/login", async (req, res, next) => {
   try {
-    const { email, password } = req.
+    const { email, password } = req.body || {};
+
+    if (!email || !password) {
+      return res.status(400).json({ message: "Missing credentials" });
+    }
+
+    const [rows] = await db.query(
+      "SELECT id, role, password_hash FROM users WHERE email = ?",
+      [email]
+    );
+
+    if (!rows.length) {
+      return res.status(401).json({ message: "Invalid credentials" });
+    }
+
+    const user = rows[0];
+
+    if (password !== user.password_hash?.trim()) {
+      return res.status(401).json({ message: "Invalid credentials" });
+    }
+
+    const token = jwt.sign(
+      { id: user.id, role: user.role },
+      JWT_SECRET,
+      { expiresIn: "7d" }
+    );
+
+    res.json({ token, role: user.role });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ===============================
+// TEST DB
+// ===============================
+app.get("/test-db", async (req, res, next) => {
+  try {
+    const [rows] = await db.query("SHOW TABLES");
+    res.json(rows);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ===============================
+// STATIC UPLOADS
+// ===============================
+app.use("/uploads", express.static(uploadDir));
+
+// ===============================
+// ERROR HANDLER
+// ===============================
+app.use((err, req, res, next) => {
+  console.error("❌ API ERROR:", err);
+  res.status(500).json({
+    message: "Internal server error",
+    error: err.message,
+  });
+});
+
+// ===============================
+// START SERVER
+// ===============================
+app.listen(PORT, () => {
+  console.log(`✅ API running on port ${PORT}`);
+});
