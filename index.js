@@ -17,9 +17,13 @@ const pool = mysql.createPool({
 app.get("/tables", async (req, res) => {
   try {
     const [rows] = await pool.query("SHOW TABLES");
-    res.json(rows);
+    res.json({ success: true, tables: rows });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error("DB ERROR:", err); // 👈 IMPORTANT
+    res.status(500).json({
+      success: false,
+      error: err,
+    });
   }
 });
 
