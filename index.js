@@ -14,6 +14,15 @@ const pool = mysql.createPool({
   connectionLimit: 10,
 });
 
+app.get("/tables", async (req, res) => {
+  try {
+    const [rows] = await pool.query("SHOW TABLES");
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Root check
 app.get("/", (req, res) => {
   res.send("API is running");
