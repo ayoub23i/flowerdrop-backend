@@ -2,7 +2,7 @@ const express = require("express");
 const mysql = require("mysql2/promise");
 
 const app = express();
-console.log("DB HOST:", process.env.MYSQLHOST);
+console.log("DbB HOST:", process.env.MYSQLHOST);
 // Create MySQL pool using Railway env
 const pool = mysql.createPool({
   host: process.env.MYSQLHOST,
