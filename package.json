@@ -5,10 +5,15 @@
     "start": "node index.js"
   },
   "dependencies": {
+<<<<<<< HEAD
     "cors": "^2.8.6",
     "express": "^4.22.1",
     "jsonwebtoken": "^9.0.3",
     "multer": "^2.0.2",
     "mysql2": "^3.16.1"
+=======
+    "express": "^4.18.2",
+    "mysql2": "^3.9.0"
+>>>>>>> dedd29ffb904bef2e7e213f22114a7d89056efe4
   }
 }

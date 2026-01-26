@@ -10,10 +10,10 @@ const path = require("path");
 const fs = require("fs");
 
 // ===============================
-// CONFIG
+// CONFIG (ENV-BASED)
 // ===============================
 const PORT = process.env.PORT || 3000;
-const JWT_SECRET = process.env.JWT_SECRET || "flowerdrop_secret";
+const JWT_SECRET = process.env.JWT_SECRET;
 
 // ===============================
 // APP SETUP
@@ -23,17 +23,24 @@ app.use(cors());
 app.use(express.json());
 
 // ===============================
-// DATABASE (RAILWAY)
+// DATABASE CONNECTION (RAILWAY)
 // ===============================
-const db = mysql.createPool(process.env.MYSQL_URL);
+const db = mysql.createPool({
+  host: process.env.MYSQLHOST,
+  user: process.env.MYSQLUSER,
+  password: process.env.MYSQLPASSWORD,
+  database: process.env.MYSQLDATABASE,
+  port: process.env.MYSQLPORT,
+  waitForConnections: true,
+  connectionLimit: 10,
+});
 
 // ===============================
-// UPLOADS (TEMP FILESYSTEM)
+// UPLOADS SETUP
+// ⚠ Railway filesystem is ephemeral (OK for MVP)
 // ===============================
 const uploadDir = path.join(__dirname, "uploads");
-if (!fs.existsSync(uploadDir)) {
-  fs.mkdirSync(uploadDir);
-}
+if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
 
 const upload = multer({
   storage: multer.diskStorage({
@@ -64,10 +71,10 @@ function requireAuth(req, res, next) {
 }
 
 // ===============================
-// HEALTH CHECK
+// HEALTH
 // ===============================
 app.get("/", (req, res) => {
-  res.status(200).json({ message: "Delivery API running" });
+  res.status(200).json({ message: "FlowerDrop API running" });
 });
 
 // ===============================
@@ -102,23 +109,211 @@ app.post("/login", async (req, res, next) => {
       { expiresIn: "7d" }
     );
 
-    res.json({ token, role: user.role });
+    return res.status(200).json({
+      token,
+      role: user.role,
+    });
   } catch (err) {
     next(err);
   }
 });
 
 // ===============================
-// TEST DB
+// ME
 // ===============================
-app.get("/test-db", async (req, res, next) => {
+app.get("/me", requireAuth, async (req, res, next) => {
   try {
-    const [rows] = await db.query("SHOW TABLES");
+    const [rows] = await db.query(
+      "SELECT id, email, role FROM users WHERE id = ?",
+      [req.user.id]
+    );
+
+    if (!rows.length) {
+      return res.status(401).json({ message: "User not found" });
+    }
+
+    return res.status(200).json(rows[0]);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ===============================
+// STORE ORDERS
+// ===============================
+app.get("/store/orders", requireAuth, async (req, res, next) => {
+  try {
+    if (req.user.role !== "STORE") {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    const [stores] = await db.query(
+      "SELECT id FROM stores WHERE user_id = ?",
+      [req.user.id]
+    );
+
+    if (!stores.length) return res.json([]);
+
+    const [rows] = await db.query(
+      "SELECT * FROM deliveries WHERE store_id = ? ORDER BY created_at DESC",
+      [stores[0].id]
+    );
+
     res.json(rows);
   } catch (err) {
     next(err);
   }
 });
+
+app.post("/store/orders", requireAuth, async (req, res, next) => {
+  try {
+    if (req.user.role !== "STORE") {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    const {
+      recipient_name,
+      recipient_phone,
+      dropoff_address,
+    } = req.body;
+
+    if (!recipient_name || !recipient_phone || !dropoff_address) {
+      return res.status(400).json({ message: "Missing delivery fields" });
+    }
+
+    const [stores] = await db.query(
+      "SELECT id FROM stores WHERE user_id = ?",
+      [req.user.id]
+    );
+
+    if (!stores.length) {
+      return res.status(400).json({ message: "Store not found" });
+    }
+
+    await db.query(
+      `INSERT INTO deliveries
+       (store_id, recipient_name, recipient_phone, dropoff_address, pickup_address, status)
+       VALUES (?, ?, ?, ?, 'STORE PICKUP', 'CREATED')`,
+      [
+        stores[0].id,
+        recipient_name,
+        recipient_phone,
+        dropoff_address,
+      ]
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ===============================
+// DRIVER ORDERS
+// ===============================
+app.get("/driver/orders", requireAuth, async (req, res, next) => {
+  try {
+    if (req.user.role !== "DRIVER") {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    const [drivers] = await db.query(
+      "SELECT id FROM drivers WHERE user_id = ?",
+      [req.user.id]
+    );
+
+    if (!drivers.length) return res.json([]);
+
+    const [rows] = await db.query(
+      `SELECT * FROM deliveries
+       WHERE status IN ('AVAILABLE','ACCEPTED','PICKED_UP')
+       AND (driver_id IS NULL OR driver_id = ?)`,
+      [drivers[0].id]
+    );
+
+    res.json(rows);
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.put("/driver/orders/:id/status", requireAuth, async (req, res, next) => {
+  try {
+    if (req.user.role !== "DRIVER") {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    const { status } = req.body;
+    const deliveryId = req.params.id;
+
+    const [drivers] = await db.query(
+      "SELECT id FROM drivers WHERE user_id = ?",
+      [req.user.id]
+    );
+
+    if (!drivers.length) {
+      return res.status(400).json({ message: "Driver not found" });
+    }
+
+    const driverId = drivers[0].id;
+
+    if (status === "ACCEPTED") {
+      await db.query(
+        "UPDATE deliveries SET status='ACCEPTED', driver_id=? WHERE id=? AND status='AVAILABLE'",
+        [driverId, deliveryId]
+      );
+    }
+
+    if (status === "PICKED_UP") {
+      await db.query(
+        "UPDATE deliveries SET status='PICKED_UP' WHERE id=? AND driver_id=?",
+        [deliveryId, driverId]
+      );
+    }
+
+    if (status === "DELIVERED") {
+      await db.query(
+        "UPDATE deliveries SET status='DELIVERED' WHERE id=? AND driver_id=?",
+        [deliveryId, driverId]
+      );
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ===============================
+// PROOF OF DELIVERY
+// ===============================
+app.post(
+  "/driver/orders/:id/proof",
+  requireAuth,
+  upload.single("photo"),
+  async (req, res, next) => {
+    try {
+      if (req.user.role !== "DRIVER") {
+        return res.status(403).json({ message: "Forbidden" });
+      }
+
+      if (!req.file) {
+        return res.status(400).json({ message: "No photo uploaded" });
+      }
+
+      const imageUrl = `/uploads/${req.file.filename}`;
+
+      await db.query(
+        "INSERT INTO delivery_proofs (delivery_id, image_url) VALUES (?, ?)",
+        [req.params.id, imageUrl]
+      );
+
+      res.json({ success: true, imageUrl });
+    } catch (err) {
+      next(err);
+    }
+  }
+);
 
 // ===============================
 // STATIC UPLOADS
@@ -126,13 +321,12 @@ app.get("/test-db", async (req, res, next) => {
 app.use("/uploads", express.static(uploadDir));
 
 // ===============================
-// ERROR HANDLER
+// GLOBAL ERROR HANDLER
 // ===============================
 app.use((err, req, res, next) => {
   console.error("❌ API ERROR:", err);
   res.status(500).json({
     message: "Internal server error",
-    error: err.message,
   });
 });
 
@@ -140,5 +334,5 @@ app.use((err, req, res, next) => {
 // START SERVER
 // ===============================
 app.listen(PORT, () => {
-  console.log(`✅ API running on port ${PORT}`);
+  console.log(`✅ FlowerDrop API running on port ${PORT}`);
 });
