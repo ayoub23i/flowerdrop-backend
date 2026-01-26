@@ -279,6 +279,46 @@ app.get("/driver/orders", requireAuth, async (req, res, next) => {
 });
 
 // ===============================
+// DRIVER UPLOAD PROOF (URL ONLY)
+// ===============================
+app.post("/driver/orders/:id/proof", requireAuth, async (req, res, next) => {
+  try {
+    if (req.user.role !== "DRIVER") {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    const { image_url } = req.body;
+    if (!image_url) {
+      return res.status(400).json({ message: "image_url is required" });
+    }
+
+    const driverId = await getDriverId(req.user.id);
+    if (!driverId) return res.status(400).json({ message: "Driver not found" });
+
+    const [rows] = await db.query(
+      "SELECT id FROM deliveries WHERE id=? AND driver_id=? AND status='PICKED_UP'",
+      [req.params.id, driverId]
+    );
+
+    if (!rows.length) {
+      return res.status(400).json({
+        message: "Delivery not eligible for proof upload",
+      });
+    }
+
+    await db.query(
+      `INSERT INTO delivery_proofs (delivery_id, image_url, uploaded_by, created_at)
+       VALUES (?, ?, 'DRIVER', NOW())`,
+      [req.params.id, image_url]
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ===============================
 // DRIVER UPDATE STATUS
 // ===============================
 app.put("/driver/orders/:id/status", requireAuth, async (req, res, next) => {
@@ -329,7 +369,22 @@ app.put("/driver/orders/:id/status", requireAuth, async (req, res, next) => {
       return res.json({ success: true });
     }
 
-    if (status === "DELIVERED" && currentStatus === "PICKED_UP") {
+    if (status === "DELIVERED") {
+      const [proofs] = await db.query(
+        "SELECT id FROM delivery_proofs WHERE delivery_id=? AND uploaded_by='DRIVER'",
+        [req.params.id]
+      );
+
+      if (!proofs.length) {
+        return res.status(400).json({
+          message: "Proof of delivery required",
+        });
+      }
+
+      if (currentStatus !== "PICKED_UP") {
+        return res.status(400).json({ message: "Must be PICKED_UP first" });
+      }
+
       await db.query(
         "UPDATE deliveries SET status='DELIVERED' WHERE id=? AND driver_id=?",
         [req.params.id, driverId]
