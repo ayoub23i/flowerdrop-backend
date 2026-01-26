@@ -1,19 +1,16 @@
 {
   "name": "flowerdrop-backend",
   "version": "1.0.0",
+  "description": "FlowerDrop backend API",
+  "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-<<<<<<< HEAD
-    "cors": "^2.8.6",
-    "express": "^4.22.1",
-    "jsonwebtoken": "^9.0.3",
-    "multer": "^2.0.2",
-    "mysql2": "^3.16.1"
-=======
     "express": "^4.18.2",
-    "mysql2": "^3.9.0"
->>>>>>> dedd29ffb904bef2e7e213f22114a7d89056efe4
+    "cors": "^2.8.5",
+    "mysql2": "^3.9.0",
+    "jsonwebtoken": "^9.0.2",
+    "multer": "^1.4.5"
   }
 }
