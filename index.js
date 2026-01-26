@@ -14,6 +14,14 @@ const pool = mysql.createPool({
   connectionLimit: 10,
 });
 
+app.get("/env-check", (req, res) => {
+  res.json({
+    host: process.env.MYSQLHOST,
+    port: process.env.MYSQLPORT,
+    user: process.env.MYSQLUSER,
+    database: process.env.MYSQLDATABASE,
+  });
+});
 app.get("/tables", async (req, res) => {
   try {
     const [rows] = await pool.query("SHOW TABLES");
