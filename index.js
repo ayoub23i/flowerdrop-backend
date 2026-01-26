@@ -5,12 +5,9 @@ const express = require("express");
 const cors = require("cors");
 const jwt = require("jsonwebtoken");
 const mysql = require("mysql2/promise");
-const multer = require("multer");
-const path = require("path");
-const fs = require("fs");
 
 // ===============================
-// CONFIG (ENV-BASED)
+// CONFIG (ENV)
 // ===============================
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET;
@@ -36,23 +33,6 @@ const db = mysql.createPool({
 });
 
 // ===============================
-// UPLOADS SETUP
-// ⚠ Railway filesystem is ephemeral (OK for MVP)
-// ===============================
-const uploadDir = path.join(__dirname, "uploads");
-if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
-
-const upload = multer({
-  storage: multer.diskStorage({
-    destination: uploadDir,
-    filename: (req, file, cb) => {
-      const ext = path.extname(file.originalname || ".jpg");
-      cb(null, `proof-${Date.now()}${ext}`);
-    },
-  }),
-});
-
-// ===============================
 // AUTH MIDDLEWARE
 // ===============================
 function requireAuth(req, res, next) {
@@ -74,7 +54,7 @@ function requireAuth(req, res, next) {
 // HEALTH
 // ===============================
 app.get("/", (req, res) => {
-  res.status(200).json({ message: "FlowerDrop API running" });
+  res.json({ message: "FlowerDrop API running" });
 });
 
 // ===============================
@@ -109,10 +89,7 @@ app.post("/login", async (req, res, next) => {
       { expiresIn: "7d" }
     );
 
-    return res.status(200).json({
-      token,
-      role: user.role,
-    });
+    res.json({ token, role: user.role });
   } catch (err) {
     next(err);
   }
@@ -129,10 +106,10 @@ app.get("/me", requireAuth, async (req, res, next) => {
     );
 
     if (!rows.length) {
-      return res.status(401).json({ message: "User not found" });
+      return res.status(404).json({ message: "User not found" });
     }
 
-    return res.status(200).json(rows[0]);
+    res.json(rows[0]);
   } catch (err) {
     next(err);
   }
@@ -171,11 +148,7 @@ app.post("/store/orders", requireAuth, async (req, res, next) => {
       return res.status(403).json({ message: "Forbidden" });
     }
 
-    const {
-      recipient_name,
-      recipient_phone,
-      dropoff_address,
-    } = req.body;
+    const { recipient_name, recipient_phone, dropoff_address } = req.body;
 
     if (!recipient_name || !recipient_phone || !dropoff_address) {
       return res.status(400).json({ message: "Missing delivery fields" });
@@ -194,12 +167,7 @@ app.post("/store/orders", requireAuth, async (req, res, next) => {
       `INSERT INTO deliveries
        (store_id, recipient_name, recipient_phone, dropoff_address, pickup_address, status)
        VALUES (?, ?, ?, ?, 'STORE PICKUP', 'CREATED')`,
-      [
-        stores[0].id,
-        recipient_name,
-        recipient_phone,
-        dropoff_address,
-      ]
+      [stores[0].id, recipient_name, recipient_phone, dropoff_address]
     );
 
     res.json({ success: true });
@@ -285,49 +253,20 @@ app.put("/driver/orders/:id/status", requireAuth, async (req, res, next) => {
 });
 
 // ===============================
-// PROOF OF DELIVERY
+// PROOF UPLOAD (TEMP DISABLED)
 // ===============================
-app.post(
-  "/driver/orders/:id/proof",
-  requireAuth,
-  upload.single("photo"),
-  async (req, res, next) => {
-    try {
-      if (req.user.role !== "DRIVER") {
-        return res.status(403).json({ message: "Forbidden" });
-      }
-
-      if (!req.file) {
-        return res.status(400).json({ message: "No photo uploaded" });
-      }
-
-      const imageUrl = `/uploads/${req.file.filename}`;
-
-      await db.query(
-        "INSERT INTO delivery_proofs (delivery_id, image_url) VALUES (?, ?)",
-        [req.params.id, imageUrl]
-      );
-
-      res.json({ success: true, imageUrl });
-    } catch (err) {
-      next(err);
-    }
-  }
-);
-
-// ===============================
-// STATIC UPLOADS
-// ===============================
-app.use("/uploads", express.static(uploadDir));
+app.post("/driver/orders/:id/proof", requireAuth, (req, res) => {
+  res.status(501).json({
+    message: "Proof upload temporarily disabled",
+  });
+});
 
 // ===============================
 // GLOBAL ERROR HANDLER
 // ===============================
 app.use((err, req, res, next) => {
   console.error("❌ API ERROR:", err);
-  res.status(500).json({
-    message: "Internal server error",
-  });
+  res.status(500).json({ message: "Internal server error" });
 });
 
 // ===============================
