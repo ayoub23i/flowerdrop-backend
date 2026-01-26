@@ -11,5 +11,7 @@
     "cors": "^2.8.5",
     "mysql2": "^3.9.0",
     "jsonwebtoken": "^9.0.2"
+    "image_picker": ^1.0.7
+     "http": ^1.2.0
   }
 }
