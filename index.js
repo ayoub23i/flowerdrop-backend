@@ -38,15 +38,37 @@ const db = mysql.createPool({
 function requireAuth(req, res, next) {
   try {
     const auth = req.headers.authorization;
-    if (!auth) {
-      return res.status(401).json({ message: "Missing token" });
+    if (!auth) return res.status(401).json({ message: "Missing token" });
+
+    if (!JWT_SECRET) {
+      return res.status(500).json({ message: "JWT_SECRET not set" });
     }
+
     const token = auth.split(" ")[1];
     req.user = jwt.verify(token, JWT_SECRET);
     next();
   } catch (err) {
     return res.status(401).json({ message: "Invalid token" });
   }
+}
+
+// ===============================
+// HELPERS
+// ===============================
+async function getStoreId(userId) {
+  const [rows] = await db.query(
+    "SELECT id FROM stores WHERE user_id = ?",
+    [userId]
+  );
+  return rows.length ? rows[0].id : null;
+}
+
+async function getDriverId(userId) {
+  const [rows] = await db.query(
+    "SELECT id FROM drivers WHERE user_id = ?",
+    [userId]
+  );
+  return rows.length ? rows[0].id : null;
 }
 
 // ===============================
@@ -96,9 +118,7 @@ app.get("/me", requireAuth, async (req, res, next) => {
       "SELECT id, email, role FROM users WHERE id = ?",
       [req.user.id]
     );
-    if (!rows.length) {
-      return res.status(404).json({ message: "User not found" });
-    }
+    if (!rows.length) return res.status(404).json({ message: "User not found" });
     res.json(rows[0]);
   } catch (err) {
     next(err);
@@ -114,16 +134,12 @@ app.get("/store/orders", requireAuth, async (req, res, next) => {
       return res.status(403).json({ message: "Forbidden" });
     }
 
-    const [stores] = await db.query(
-      "SELECT id FROM stores WHERE user_id = ?",
-      [req.user.id]
-    );
-
-    if (!stores.length) return res.json([]);
+    const storeId = await getStoreId(req.user.id);
+    if (!storeId) return res.status(400).json({ message: "Store not found" });
 
     const [rows] = await db.query(
       "SELECT * FROM deliveries WHERE store_id = ? ORDER BY created_at DESC",
-      [stores[0].id]
+      [storeId]
     );
 
     res.json(rows);
@@ -143,16 +159,14 @@ app.post("/store/orders", requireAuth, async (req, res, next) => {
       return res.status(400).json({ message: "Missing delivery fields" });
     }
 
-    const [stores] = await db.query(
-      "SELECT id FROM stores WHERE user_id = ?",
-      [req.user.id]
-    );
+    const storeId = await getStoreId(req.user.id);
+    if (!storeId) return res.status(400).json({ message: "Store not found" });
 
     await db.query(
       `INSERT INTO deliveries
        (store_id, recipient_name, recipient_phone, dropoff_address, pickup_address, status)
        VALUES (?, ?, ?, ?, 'STORE PICKUP', 'CREATED')`,
-      [stores[0].id, recipient_name, recipient_phone, dropoff_address]
+      [storeId, recipient_name, recipient_phone, dropoff_address]
     );
 
     res.json({ success: true });
@@ -170,22 +184,36 @@ app.put("/store/orders/:id/status", requireAuth, async (req, res, next) => {
       return res.status(403).json({ message: "Forbidden" });
     }
 
-    const { status } = req.body;
+    const { status } = req.body || {};
     const allowed = ["PREPARING", "READY_FOR_PICKUP"];
     if (!allowed.includes(status)) {
       return res.status(400).json({ message: "Invalid store status" });
     }
 
-    const [stores] = await db.query(
-      "SELECT id FROM stores WHERE user_id = ?",
-      [req.user.id]
+    const storeId = await getStoreId(req.user.id);
+    if (!storeId) return res.status(400).json({ message: "Store not found" });
+
+    const [current] = await db.query(
+      "SELECT status FROM deliveries WHERE id = ? AND store_id = ?",
+      [req.params.id, storeId]
     );
+    if (!current.length) {
+      return res.status(404).json({ message: "Delivery not found" });
+    }
+
+    const cur = current[0].status;
+    if (
+      (cur === "CREATED" && status !== "PREPARING") ||
+      (cur === "PREPARING" && status !== "READY_FOR_PICKUP")
+    ) {
+      return res.status(400).json({
+        message: `Invalid transition from ${cur} to ${status}`,
+      });
+    }
 
     await db.query(
-      `UPDATE deliveries
-       SET status = ?
-       WHERE id = ? AND store_id = ?`,
-      [status, req.params.id, stores[0].id]
+      "UPDATE deliveries SET status = ? WHERE id = ? AND store_id = ?",
+      [status, req.params.id, storeId]
     );
 
     res.json({ success: true });
@@ -203,17 +231,14 @@ app.delete("/store/orders/:id", requireAuth, async (req, res, next) => {
       return res.status(403).json({ message: "Forbidden" });
     }
 
-    const [stores] = await db.query(
-      "SELECT id FROM stores WHERE user_id = ?",
-      [req.user.id]
-    );
+    const storeId = await getStoreId(req.user.id);
+    if (!storeId) return res.status(400).json({ message: "Store not found" });
 
     const [result] = await db.query(
       `DELETE FROM deliveries
-       WHERE id = ?
-       AND store_id = ?
+       WHERE id = ? AND store_id = ?
        AND status IN ('CREATED','PREPARING')`,
-      [req.params.id, stores[0].id]
+      [req.params.id, storeId]
     );
 
     if (result.affectedRows === 0) {
@@ -237,16 +262,14 @@ app.get("/driver/orders", requireAuth, async (req, res, next) => {
       return res.status(403).json({ message: "Forbidden" });
     }
 
-    const [drivers] = await db.query(
-      "SELECT id FROM drivers WHERE user_id = ?",
-      [req.user.id]
-    );
+    const driverId = await getDriverId(req.user.id);
+    if (!driverId) return res.status(400).json({ message: "Driver not found" });
 
     const [rows] = await db.query(
       `SELECT * FROM deliveries
        WHERE status IN ('READY_FOR_PICKUP','ACCEPTED','PICKED_UP')
        AND (driver_id IS NULL OR driver_id = ?)`,
-      [drivers[0].id]
+      [driverId]
     );
 
     res.json(rows);
@@ -264,42 +287,57 @@ app.put("/driver/orders/:id/status", requireAuth, async (req, res, next) => {
       return res.status(403).json({ message: "Forbidden" });
     }
 
-    const { status } = req.body;
-    const [drivers] = await db.query(
-      "SELECT id FROM drivers WHERE user_id = ?",
-      [req.user.id]
-    );
+    const { status } = req.body || {};
+    const allowed = ["ACCEPTED", "PICKED_UP", "DELIVERED"];
+    if (!allowed.includes(status)) {
+      return res.status(400).json({ message: "Invalid driver status" });
+    }
 
-    const driverId = drivers[0].id;
+    const driverId = await getDriverId(req.user.id);
+    if (!driverId) return res.status(400).json({ message: "Driver not found" });
+
+    const [cur] = await db.query(
+      "SELECT status, driver_id FROM deliveries WHERE id = ?",
+      [req.params.id]
+    );
+    if (!cur.length) return res.status(404).json({ message: "Delivery not found" });
+
+    const currentStatus = cur[0].status;
+    const currentDriver = cur[0].driver_id;
 
     if (status === "ACCEPTED") {
+      if (currentStatus !== "READY_FOR_PICKUP") {
+        return res.status(400).json({ message: "Not ready for pickup" });
+      }
+
       await db.query(
-        `UPDATE deliveries
-         SET status='ACCEPTED', driver_id=?
-         WHERE id=? AND status='READY_FOR_PICKUP'`,
+        "UPDATE deliveries SET status='ACCEPTED', driver_id=? WHERE id=?",
         [driverId, req.params.id]
       );
+      return res.json({ success: true });
     }
 
-    if (status === "PICKED_UP") {
+    if (currentDriver !== driverId) {
+      return res.status(403).json({ message: "Not your delivery" });
+    }
+
+    if (status === "PICKED_UP" && currentStatus === "ACCEPTED") {
       await db.query(
-        `UPDATE deliveries
-         SET status='PICKED_UP'
-         WHERE id=? AND driver_id=?`,
+        "UPDATE deliveries SET status='PICKED_UP' WHERE id=? AND driver_id=?",
         [req.params.id, driverId]
       );
+      return res.json({ success: true });
     }
 
-    if (status === "DELIVERED") {
+    if (status === "DELIVERED" && currentStatus === "PICKED_UP") {
       await db.query(
-        `UPDATE deliveries
-         SET status='DELIVERED'
-         WHERE id=? AND driver_id=?`,
+        "UPDATE deliveries SET status='DELIVERED' WHERE id=? AND driver_id=?",
         [req.params.id, driverId]
       );
+      return res.json({ success: true });
     }
 
-    res.json({ success: true });
+    res.status(400).json({ message: "Invalid status transition" });
   } catch (err) {
     next(err);
   }
@@ -310,7 +348,7 @@ app.put("/driver/orders/:id/status", requireAuth, async (req, res, next) => {
 // ===============================
 app.use((err, req, res, next) => {
   console.error("❌ API ERROR:", err);
-  res.status(500).json({ message: "Internal server error" });
+  res.status(500).json({ message: err.message || "Internal server error" });
 });
 
 // ===============================
