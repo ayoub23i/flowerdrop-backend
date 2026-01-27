@@ -7,6 +7,7 @@ const jwt = require("jsonwebtoken");
 const mysql = require("mysql2/promise");
 const path = require("path");
 const fs = require("fs");
+const multer = require("multer");
 
 // ===============================
 // CONFIG
@@ -40,6 +41,16 @@ const db = mysql.createPool({
 // ===============================
 const uploadDir = path.join(__dirname, "uploads");
 if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
+
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: uploadDir,
+    filename: (req, file, cb) => {
+      const ext = path.extname(file.originalname || ".jpg");
+      cb(null, `proof-${Date.now()}${ext}`);
+    },
+  }),
+});
 
 // ===============================
 // AUTH
@@ -76,7 +87,7 @@ async function getDriverId(userId) {
 }
 
 // ===============================
-// LOGIN (UNCHANGED)
+// LOGIN
 // ===============================
 app.post("/login", async (req, res) => {
   const { email, password } = req.body;
@@ -102,12 +113,8 @@ app.post("/login", async (req, res) => {
 // =======================================================
 // STORE
 // =======================================================
-
-// STORE → VIEW ORDERS (UNCHANGED + EXTENDED)
 app.get("/store/orders", requireAuth, async (req, res) => {
-  if (req.user.role !== "STORE") {
-    return res.status(403).json({ message: "Forbidden" });
-  }
+  if (req.user.role !== "STORE") return res.status(403).json({ message: "Forbidden" });
 
   const storeId = await getStoreId(req.user.id);
   const [deliveries] = await db.query(
@@ -116,96 +123,23 @@ app.get("/store/orders", requireAuth, async (req, res) => {
   );
 
   for (const d of deliveries) {
-    // proofs (STRING URLs – backward compatible)
     const [proofs] = await db.query(
       "SELECT image_url FROM delivery_proofs WHERE delivery_id = ?",
       [d.id]
     );
     d.proof_images = proofs.map(p => `${BASE_URL}${p.image_url}`);
-
-    // driver info
-    if (d.driver_id) {
-      const [rows] = await db.query(
-        `
-        SELECT dr.id, u.name, u.phone
-        FROM drivers dr
-        JOIN users u ON u.id = dr.user_id
-        WHERE dr.id = ?
-        `,
-        [d.driver_id]
-      );
-      d.driver = rows.length ? rows[0] : null;
-    } else {
-      d.driver = null;
-    }
   }
 
   res.json(deliveries);
 });
 
-// STORE → CREATE DELIVERY (RESTORED)
-app.post("/store/orders", requireAuth, async (req, res) => {
-  if (req.user.role !== "STORE") {
-    return res.status(403).json({ message: "Forbidden" });
-  }
-
-  const { recipient_name, recipient_phone, dropoff_address } = req.body;
-  const storeId = await getStoreId(req.user.id);
-
-  await db.query(
-    `
-    INSERT INTO deliveries
-    (store_id, recipient_name, recipient_phone, dropoff_address, pickup_address, status)
-    VALUES (?, ?, ?, ?, 'STORE PICKUP', 'CREATED')
-    `,
-    [storeId, recipient_name, recipient_phone, dropoff_address]
-  );
-
-  res.json({ success: true });
-});
-
-// STORE → STATUS SWITCH (CREATED → PREPARING → READY_FOR_PICKUP)
-app.put("/store/orders/:id/status", requireAuth, async (req, res) => {
-  if (req.user.role !== "STORE") {
-    return res.status(403).json({ message: "Forbidden" });
-  }
-
-  const { status } = req.body;
-  const storeId = await getStoreId(req.user.id);
-
-  const [cur] = await db.query(
-    "SELECT status FROM deliveries WHERE id = ? AND store_id = ?",
-    [req.params.id, storeId]
-  );
-
-  const current = cur[0]?.status;
-  if (
-    (current === "CREATED" && status !== "PREPARING") ||
-    (current === "PREPARING" && status !== "READY_FOR_PICKUP")
-  ) {
-    return res.status(400).json({ message: "Invalid transition" });
-  }
-
-  await db.query(
-    "UPDATE deliveries SET status = ? WHERE id = ?",
-    [status, req.params.id]
-  );
-
-  res.json({ success: true });
-});
-
 // =======================================================
 // DRIVER
 // =======================================================
-
-// DRIVER → AVAILABLE + ASSIGNED JOBS (EXTENDED)
 app.get("/driver/orders", requireAuth, async (req, res) => {
-  if (req.user.role !== "DRIVER") {
-    return res.status(403).json({ message: "Forbidden" });
-  }
+  if (req.user.role !== "DRIVER") return res.status(403).json({ message: "Forbidden" });
 
   const driverId = await getDriverId(req.user.id);
-
   const [deliveries] = await db.query(
     `
     SELECT *
@@ -217,67 +151,56 @@ app.get("/driver/orders", requireAuth, async (req, res) => {
     [driverId]
   );
 
-  for (const d of deliveries) {
-    const [rows] = await db.query(
-      `
-      SELECT s.id, u.name, u.phone
-      FROM stores s
-      JOIN users u ON u.id = s.user_id
-      WHERE s.id = ?
-      `,
-      [d.store_id]
-    );
-    d.store = rows.length ? rows[0] : null;
-  }
-
   res.json(deliveries);
 });
 
-// DRIVER → UPDATE STATUS
-app.put("/driver/orders/:id/status", requireAuth, async (req, res) => {
-  if (req.user.role !== "DRIVER") {
-    return res.status(403).json({ message: "Forbidden" });
-  }
+// =======================================================
+// DRIVER → UPLOAD PROOF (REAL FILE UPLOAD)
+// =======================================================
+app.post(
+  "/driver/orders/:id/proof",
+  requireAuth,
+  upload.single("photo"),
+  async (req, res) => {
+    if (req.user.role !== "DRIVER") {
+      return res.status(403).json({ message: "Forbidden" });
+    }
 
-  const { status } = req.body;
-  const driverId = await getDriverId(req.user.id);
+    if (!req.file) {
+      return res.status(400).json({ message: "No file uploaded" });
+    }
 
-  if (status === "ACCEPTED") {
-    await db.query(
-      "UPDATE deliveries SET status='ACCEPTED', driver_id=? WHERE id=? AND status='READY_FOR_PICKUP'",
-      [driverId, req.params.id]
-    );
-  }
+    const driverId = await getDriverId(req.user.id);
 
-  if (status === "PICKED_UP") {
-    await db.query(
-      "UPDATE deliveries SET status='PICKED_UP' WHERE id=? AND driver_id=?",
+    const [eligible] = await db.query(
+      "SELECT id FROM deliveries WHERE id=? AND driver_id=? AND status='PICKED_UP'",
       [req.params.id, driverId]
     );
-  }
 
-  if (status === "DELIVERED") {
+    if (!eligible.length) {
+      return res.status(400).json({ message: "Delivery not eligible" });
+    }
+
+    const imageUrl = `/uploads/${req.file.filename}`;
+
     await db.query(
-      "UPDATE deliveries SET status='DELIVERED' WHERE id=? AND driver_id=?",
-      [req.params.id, driverId]
+      `
+      INSERT INTO delivery_proofs (delivery_id, image_url, uploaded_by)
+      VALUES (?, ?, 'DRIVER')
+      `,
+      [req.params.id, imageUrl]
     );
+
+    res.json({
+      success: true,
+      image_url: `${BASE_URL}${imageUrl}`,
+    });
   }
+);
 
-  res.json({ success: true });
-});
-
-// =======================================================
-// PROOF DOWNLOAD (ADDITIVE)
-// =======================================================
-app.get("/download/proof/:id", requireAuth, async (req, res) => {
-  const [rows] = await db.query(
-    "SELECT image_url FROM delivery_proofs WHERE id = ?",
-    [req.params.id]
-  );
-  const filePath = path.join(__dirname, rows[0].image_url);
-  res.download(filePath);
-});
-
+// ===============================
+// STATIC UPLOADS
+// ===============================
 app.use("/uploads", express.static(uploadDir));
 
 // ===============================
