@@ -108,7 +108,7 @@ app.post("/login", async (req, res, next) => {
     next(err);
   }
 });
-
+print("BACKEND URL => ${ApiConfig.baseUrl}");
 // ===============================
 // ME
 // ===============================
