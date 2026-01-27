@@ -126,7 +126,7 @@ app.get("/me", requireAuth, async (req, res, next) => {
 });
 
 // ===============================
-// STORE ORDERS (UPDATED)
+// STORE ORDERS (WITH PROOFS)
 // ===============================
 app.get("/store/orders", requireAuth, async (req, res, next) => {
   try {
@@ -141,7 +141,11 @@ app.get("/store/orders", requireAuth, async (req, res, next) => {
       `
       SELECT
         d.*,
-        JSON_ARRAYAGG(p.image_url) AS proof_images
+        JSON_ARRAYAGG(
+          CASE
+            WHEN p.image_url IS NOT NULL THEN p.image_url
+          END
+        ) AS proof_images
       FROM deliveries d
       LEFT JOIN delivery_proofs p
         ON p.delivery_id = d.id
@@ -189,9 +193,105 @@ app.post("/store/orders", requireAuth, async (req, res, next) => {
 });
 
 // ===============================
-// (REST OF FILE UNCHANGED)
+// DRIVER UPLOAD PROOF (MAX 2)
 // ===============================
+app.post("/driver/orders/:id/proof", requireAuth, async (req, res, next) => {
+  try {
+    if (req.user.role !== "DRIVER") {
+      return res.status(403).json({ message: "Forbidden" });
+    }
 
+    const { image_url } = req.body;
+    if (!image_url) {
+      return res.status(400).json({ message: "image_url is required" });
+    }
+
+    const driverId = await getDriverId(req.user.id);
+    if (!driverId) return res.status(400).json({ message: "Driver not found" });
+
+    const [[countRow]] = await db.query(
+      `
+      SELECT COUNT(*) AS count
+      FROM delivery_proofs
+      WHERE delivery_id = ?
+        AND uploaded_by = 'DRIVER'
+      `,
+      [req.params.id]
+    );
+
+    if (countRow.count >= 2) {
+      return res.status(400).json({
+        message: "Maximum of 2 proof photos allowed",
+      });
+    }
+
+    await db.query(
+      `INSERT INTO delivery_proofs (delivery_id, image_url, uploaded_by, created_at)
+       VALUES (?, ?, 'DRIVER', NOW())`,
+      [req.params.id, image_url]
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ===============================
+// DRIVER UPDATE STATUS (MIN 2)
+// ===============================
+app.put("/driver/orders/:id/status", requireAuth, async (req, res, next) => {
+  try {
+    if (req.user.role !== "DRIVER") {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    const { status } = req.body || {};
+    const allowed = ["ACCEPTED", "PICKED_UP", "DELIVERED"];
+    if (!allowed.includes(status)) {
+      return res.status(400).json({ message: "Invalid driver status" });
+    }
+
+    if (status === "DELIVERED") {
+      const [[row]] = await db.query(
+        `
+        SELECT COUNT(*) AS count
+        FROM delivery_proofs
+        WHERE delivery_id = ?
+          AND uploaded_by = 'DRIVER'
+        `,
+        [req.params.id]
+      );
+
+      if (row.count < 2) {
+        return res.status(400).json({
+          message: "2 proof photos are required before delivery",
+        });
+      }
+    }
+
+    await db.query(
+      "UPDATE deliveries SET status = ? WHERE id = ?",
+      [status, req.params.id]
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ===============================
+// GLOBAL ERROR HANDLER
+// ===============================
+app.use((err, req, res, next) => {
+  console.error("❌ API ERROR:", err);
+  res.status(500).json({ message: err.message || "Internal server error" });
+});
+
+// ===============================
+// START SERVER
+// ===============================
 app.listen(PORT, () => {
   console.log(`✅ FlowerDrop API running on port ${PORT}`);
 });
