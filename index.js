@@ -62,12 +62,16 @@ function requireAuth(req, res, next) {
 // HELPERS
 // ===============================
 async function getStoreId(userId) {
-  const [rows] = await db.query("SELECT id FROM stores WHERE user_id = ?", [userId]);
+  const [rows] = await db.query("SELECT id FROM stores WHERE user_id = ?", [
+    userId,
+  ]);
   return rows[0]?.id ?? null;
 }
 
 async function getDriverId(userId) {
-  const [rows] = await db.query("SELECT id FROM drivers WHERE user_id = ?", [userId]);
+  const [rows] = await db.query("SELECT id FROM drivers WHERE user_id = ?", [
+    userId,
+  ]);
   return rows[0]?.id ?? null;
 }
 
@@ -110,7 +114,27 @@ app.post("/login", async (req, res, next) => {
 });
 
 // ===============================
-// STORE – ORDERS (VIEW + DOWNLOAD READY)
+// ME
+// ===============================
+app.get("/me", requireAuth, async (req, res, next) => {
+  try {
+    const [rows] = await db.query(
+      "SELECT id, email, name, phone, role FROM users WHERE id = ?",
+      [req.user.id]
+    );
+    if (!rows.length) return res.status(404).json({ message: "User not found" });
+    res.json(rows[0]);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// =======================================================
+// STORE
+// =======================================================
+
+// ===============================
+// STORE ORDERS (SAFE + WORKING)
 // ===============================
 app.get("/store/orders", requireAuth, async (req, res, next) => {
   try {
@@ -122,25 +146,39 @@ app.get("/store/orders", requireAuth, async (req, res, next) => {
     if (!storeId) return res.status(400).json({ message: "Store not found" });
 
     const [deliveries] = await db.query(
-      `
-      SELECT d.*
-      FROM deliveries d
-      WHERE d.store_id = ?
-      ORDER BY d.created_at DESC
-      `,
+      "SELECT * FROM deliveries WHERE store_id = ? ORDER BY created_at DESC",
       [storeId]
     );
 
     for (const d of deliveries) {
+      // proofs (KEEP STRING ARRAY)
       const [proofs] = await db.query(
-        "SELECT id, image_url FROM delivery_proofs WHERE delivery_id = ?",
+        "SELECT image_url FROM delivery_proofs WHERE delivery_id = ? ORDER BY created_at ASC",
         [d.id]
       );
 
-      d.proof_images = proofs.map((p) => ({
-        view_url: `${BASE_URL}${p.image_url}`,               // 👀 view
-        download_url: `${BASE_URL}/download/proof/${p.id}`, // ⬇️ download
-      }));
+      d.proof_images = proofs.map(
+        (p) => `${BASE_URL}${p.image_url}`
+      );
+
+      // driver info
+      if (d.driver_id) {
+        const [rows] = await db.query(
+          `
+          SELECT dr.id, u.name, u.phone
+          FROM drivers dr
+          JOIN users u ON u.id = dr.user_id
+          WHERE dr.id = ?
+          `,
+          [d.driver_id]
+        );
+
+        d.driver = rows.length
+          ? { id: rows[0].id, name: rows[0].name, phone: rows[0].phone }
+          : null;
+      } else {
+        d.driver = null;
+      }
     }
 
     res.json(deliveries);
@@ -150,7 +188,69 @@ app.get("/store/orders", requireAuth, async (req, res, next) => {
 });
 
 // ===============================
-// DOWNLOAD PROOF (SECURE)
+// STORE CREATE DELIVERY (UNCHANGED)
+// ===============================
+app.post("/store/orders", requireAuth, async (req, res, next) => {
+  try {
+    if (req.user.role !== "STORE") {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    const { recipient_name, recipient_phone, dropoff_address } = req.body || {};
+    if (!recipient_name || !recipient_phone || !dropoff_address) {
+      return res.status(400).json({ message: "Missing delivery fields" });
+    }
+
+    const storeId = await getStoreId(req.user.id);
+    if (!storeId) return res.status(400).json({ message: "Store not found" });
+
+    await db.query(
+      `INSERT INTO deliveries
+       (store_id, recipient_name, recipient_phone, dropoff_address, pickup_address, status)
+       VALUES (?, ?, ?, ?, 'STORE PICKUP', 'CREATED')`,
+      [storeId, recipient_name, recipient_phone, dropoff_address]
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// =======================================================
+// DRIVER (UNCHANGED)
+// =======================================================
+
+// ===============================
+// DRIVER ORDERS
+// ===============================
+app.get("/driver/orders", requireAuth, async (req, res, next) => {
+  try {
+    if (req.user.role !== "DRIVER") {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    const driverId = await getDriverId(req.user.id);
+    if (!driverId) return res.status(400).json({ message: "Driver not found" });
+
+    const [deliveries] = await db.query(
+      `
+      SELECT * FROM deliveries
+      WHERE status IN ('READY_FOR_PICKUP','ACCEPTED','PICKED_UP')
+        AND (driver_id IS NULL OR driver_id = ?)
+      ORDER BY created_at DESC
+      `,
+      [driverId]
+    );
+
+    res.json(deliveries);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ===============================
+// DOWNLOAD PROOF (NEW, SAFE)
 // ===============================
 app.get("/download/proof/:id", requireAuth, async (req, res, next) => {
   try {
@@ -164,9 +264,8 @@ app.get("/download/proof/:id", requireAuth, async (req, res, next) => {
     }
 
     const filePath = path.join(__dirname, rows[0].image_url);
-
     if (!fs.existsSync(filePath)) {
-      return res.status(404).json({ message: "File missing on server" });
+      return res.status(404).json({ message: "File missing" });
     }
 
     res.download(filePath);
@@ -176,7 +275,7 @@ app.get("/download/proof/:id", requireAuth, async (req, res, next) => {
 });
 
 // ===============================
-// STATIC FILE SERVING (VIEW)
+// STATIC UPLOADS (VIEW)
 // ===============================
 app.use("/uploads", express.static(uploadDir));
 
