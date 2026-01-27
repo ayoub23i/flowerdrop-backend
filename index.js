@@ -115,7 +115,7 @@ app.post("/login", async (req, res, next) => {
 app.get("/me", requireAuth, async (req, res, next) => {
   try {
     const [rows] = await db.query(
-      "SELECT id, email, role FROM users WHERE id = ?",
+      "SELECT id, email, name, phone, role FROM users WHERE id = ?",
       [req.user.id]
     );
     if (!rows.length) return res.status(404).json({ message: "User not found" });
@@ -126,7 +126,7 @@ app.get("/me", requireAuth, async (req, res, next) => {
 });
 
 // ===============================
-// STORE ORDERS (WITH PROOFS)
+// STORE ORDERS (WITH DRIVER INFO)
 // ===============================
 app.get("/store/orders", requireAuth, async (req, res, next) => {
   try {
@@ -141,14 +141,26 @@ app.get("/store/orders", requireAuth, async (req, res, next) => {
       `
       SELECT
         d.*,
+
         JSON_ARRAYAGG(
-          CASE
-            WHEN p.image_url IS NOT NULL THEN p.image_url
-          END
-        ) AS proof_images
+          CASE WHEN p.image_url IS NOT NULL THEN p.image_url END
+        ) AS proof_images,
+
+        dr.id AS driver_id,
+        u.name AS driver_name,
+        u.phone AS driver_phone
+
       FROM deliveries d
+
       LEFT JOIN delivery_proofs p
         ON p.delivery_id = d.id
+
+      LEFT JOIN drivers dr
+        ON dr.id = d.driver_id
+
+      LEFT JOIN users u
+        ON u.id = dr.user_id
+
       WHERE d.store_id = ?
       GROUP BY d.id
       ORDER BY d.created_at DESC
@@ -156,7 +168,18 @@ app.get("/store/orders", requireAuth, async (req, res, next) => {
       [storeId]
     );
 
-    res.json(rows);
+    const result = rows.map((r) => ({
+      ...r,
+      driver: r.driver_id
+        ? {
+            id: r.driver_id,
+            name: r.driver_name,
+            phone: r.driver_phone,
+          }
+        : null,
+    }));
+
+    res.json(result);
   } catch (err) {
     next(err);
   }
@@ -193,6 +216,45 @@ app.post("/store/orders", requireAuth, async (req, res, next) => {
 });
 
 // ===============================
+// DRIVER ORDERS (WITH STORE INFO)
+// ===============================
+app.get("/driver/orders", requireAuth, async (req, res, next) => {
+  try {
+    if (req.user.role !== "DRIVER") {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    const driverId = await getDriverId(req.user.id);
+    if (!driverId) return res.status(400).json({ message: "Driver not found" });
+
+    const [rows] = await db.query(
+      `
+      SELECT
+        d.*,
+        s.id AS store_id,
+        s.name AS store_name
+      FROM deliveries d
+      JOIN stores s ON s.id = d.store_id
+      WHERE d.driver_id = ?
+      `,
+      [driverId]
+    );
+
+    const result = rows.map((r) => ({
+      ...r,
+      store: {
+        id: r.store_id,
+        name: r.store_name,
+      },
+    }));
+
+    res.json(result);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ===============================
 // DRIVER UPLOAD PROOF (MAX 2)
 // ===============================
 app.post("/driver/orders/:id/proof", requireAuth, async (req, res, next) => {
@@ -205,9 +267,6 @@ app.post("/driver/orders/:id/proof", requireAuth, async (req, res, next) => {
     if (!image_url) {
       return res.status(400).json({ message: "image_url is required" });
     }
-
-    const driverId = await getDriverId(req.user.id);
-    if (!driverId) return res.status(400).json({ message: "Driver not found" });
 
     const [[countRow]] = await db.query(
       `
