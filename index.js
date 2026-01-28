@@ -107,77 +107,12 @@ app.post("/login", async (req, res, next) => {
   }
 });
 
-// ===============================
-// ME
-// ===============================
-app.get("/me", requireAuth, async (req, res, next) => {
-  try {
-    const [rows] = await db.query(
-      "SELECT id, email, name, phone, role FROM users WHERE id = ?",
-      [req.user.id]
-    );
-    if (!rows.length) return res.status(404).json({ message: "User not found" });
-    res.json(rows[0]);
-  } catch (err) {
-    next(err);
-  }
-});
-
 // =======================================================
 // STORE
 // =======================================================
 
 // ===============================
-// STORE ORDERS
-// ===============================
-app.get("/store/orders", requireAuth, async (req, res, next) => {
-  try {
-    if (req.user.role !== "STORE") {
-      return res.status(403).json({ message: "Forbidden" });
-    }
-
-    const storeId = await getStoreId(req.user.id);
-    if (!storeId) return res.status(400).json({ message: "Store not found" });
-
-    const [deliveries] = await db.query(
-      "SELECT * FROM deliveries WHERE store_id = ? ORDER BY created_at DESC",
-      [storeId]
-    );
-
-    for (const d of deliveries) {
-      const [proofs] = await db.query(
-        "SELECT image_url FROM delivery_proofs WHERE delivery_id = ? ORDER BY created_at ASC",
-        [d.id]
-      );
-      d.proof_images = proofs.map((p) => p.image_url);
-
-      if (d.driver_id) {
-        const [rows] = await db.query(
-          `
-          SELECT dr.id, u.name, u.phone
-          FROM drivers dr
-          JOIN users u ON u.id = dr.user_id
-          WHERE dr.id = ?
-          `,
-          [d.driver_id]
-        );
-
-        d.driver = rows.length
-          ? { id: rows[0].id, name: rows[0].name, phone: rows[0].phone }
-          : null;
-      } else {
-        d.driver = null;
-      }
-    }
-
-    res.json(deliveries);
-  } catch (err) {
-    next(err);
-  }
-});
-
-// ===============================
-// STORE CREATE DELIVERY
+// STORE CREATE DELIVERY (ALIGNED)
 // ===============================
 app.post("/store/orders", requireAuth, async (req, res, next) => {
   try {
@@ -189,8 +124,12 @@ app.post("/store/orders", requireAuth, async (req, res, next) => {
       recipient_name,
       recipient_phone,
       dropoff_address,
-      delivery_rule = "ANY",
-      instructions = null,
+      tag_number = null,
+      deliver_before = null,
+      deliver_after = null,
+      buzz_code = null,
+      unit = null,
+      note = null,
     } = req.body || {};
 
     if (!recipient_name || !recipient_phone || !dropoff_address) {
@@ -200,110 +139,45 @@ app.post("/store/orders", requireAuth, async (req, res, next) => {
     const storeId = await getStoreId(req.user.id);
     if (!storeId) return res.status(400).json({ message: "Store not found" });
 
-    await db.query(
+    const [result] = await db.query(
       `
       INSERT INTO deliveries
-      (store_id, recipient_name, recipient_phone, dropoff_address, pickup_address, status, delivery_rule, instructions)
-      VALUES (?, ?, ?, ?, 'STORE PICKUP', 'CREATED', ?, ?)
+      (store_id, recipient_name, recipient_phone, dropoff_address, pickup_address,
+       tag_number, deliver_before, deliver_after, status)
+      VALUES (?, ?, ?, ?, 'STORE PICKUP', ?, ?, ?, 'CREATED')
       `,
       [
         storeId,
         recipient_name,
         recipient_phone,
         dropoff_address,
-        delivery_rule,
-        instructions,
+        tag_number,
+        deliver_before,
+        deliver_after,
       ]
     );
 
-    res.json({ success: true });
-  } catch (err) {
-    next(err);
-  }
-});
+    const deliveryId = result.insertId;
 
-// ===============================
-// STORE UPDATE STATUS
-// ===============================
-app.put("/store/orders/:id/status", requireAuth, async (req, res, next) => {
-  try {
-    if (req.user.role !== "STORE") {
-      return res.status(403).json({ message: "Forbidden" });
+    if (buzz_code || unit || note) {
+      await db.query(
+        `
+        INSERT INTO delivery_instructions
+        (delivery_id, buzz_code, unit, note)
+        VALUES (?, ?, ?, ?)
+        `,
+        [deliveryId, buzz_code, unit, note]
+      );
     }
 
-    const { status } = req.body || {};
-    const allowed = ["PREPARING", "READY_FOR_PICKUP"];
-    if (!allowed.includes(status)) {
-      return res.status(400).json({ message: "Invalid store status" });
-    }
-
-    const storeId = await getStoreId(req.user.id);
-    if (!storeId) return res.status(400).json({ message: "Store not found" });
-
-    const [current] = await db.query(
-      "SELECT status FROM deliveries WHERE id = ? AND store_id = ?",
-      [req.params.id, storeId]
-    );
-    if (!current.length)
-      return res.status(404).json({ message: "Delivery not found" });
-
-    const cur = current[0].status;
-
-    if (
-      (cur === "CREATED" && status !== "PREPARING") ||
-      (cur === "PREPARING" && status !== "READY_FOR_PICKUP")
-    ) {
-      return res
-        .status(400)
-        .json({ message: `Invalid transition from ${cur} to ${status}` });
-    }
-
-    await db.query(
-      "UPDATE deliveries SET status = ? WHERE id = ? AND store_id = ?",
-      [status, req.params.id, storeId]
-    );
-
-    res.json({ success: true });
-  } catch (err) {
-    next(err);
-  }
-});
-
-// ===============================
-// STORE DELETE DELIVERY
-// ===============================
-app.delete("/store/orders/:id", requireAuth, async (req, res, next) => {
-  try {
-    if (req.user.role !== "STORE") {
-      return res.status(403).json({ message: "Forbidden" });
-    }
-
-    const storeId = await getStoreId(req.user.id);
-    if (!storeId) return res.status(400).json({ message: "Store not found" });
-
-    const [result] = await db.query(
-      `
-      DELETE FROM deliveries
-      WHERE id = ? AND store_id = ?
-        AND status IN ('CREATED','PREPARING')
-      `,
-      [req.params.id, storeId]
-    );
-
-    if (result.affectedRows === 0) {
-      return res
-        .status(400)
-        .json({ message: "Cannot delete delivery at this stage" });
-    }
-
-    res.json({ success: true });
+    res.json({ success: true, delivery_id: deliveryId });
   } catch (err) {
     next(err);
   }
 });
 
 // =======================================================
-// DRIVER (UNCHANGED)
+// DRIVER / OTHER ROUTES UNCHANGED
 // =======================================================
 
 // ===============================
