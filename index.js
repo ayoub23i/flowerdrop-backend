@@ -112,7 +112,62 @@ app.post("/login", async (req, res, next) => {
 // =======================================================
 
 // ===============================
-// STORE CREATE DELIVERY (ALIGNED)
+// STORE ORDERS
+// ===============================
+app.get("/store/orders", requireAuth, async (req, res, next) => {
+  try {
+    if (req.user.role !== "STORE") {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    const storeId = await getStoreId(req.user.id);
+    if (!storeId) return res.status(400).json({ message: "Store not found" });
+
+    const [deliveries] = await db.query(
+      "SELECT * FROM deliveries WHERE store_id = ? ORDER BY created_at DESC",
+      [storeId]
+    );
+
+    for (const d of deliveries) {
+      const [proofs] = await db.query(
+        "SELECT image_url FROM delivery_proofs WHERE delivery_id = ? ORDER BY created_at ASC",
+        [d.id]
+      );
+      d.proof_images = proofs.map((p) => p.image_url);
+
+      const [inst] = await db.query(
+        "SELECT buzz_code, unit, note FROM delivery_instructions WHERE delivery_id = ?",
+        [d.id]
+      );
+      d.instructions = inst[0] ?? null;
+
+      if (d.driver_id) {
+        const [rows] = await db.query(
+          `
+          SELECT dr.id, u.name, u.phone
+          FROM drivers dr
+          JOIN users u ON u.id = dr.user_id
+          WHERE dr.id = ?
+          `,
+          [d.driver_id]
+        );
+
+        d.driver = rows.length
+          ? { id: rows[0].id, name: rows[0].name, phone: rows[0].phone }
+          : null;
+      } else {
+        d.driver = null;
+      }
+    }
+
+    res.json(deliveries);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ===============================
+// STORE CREATE DELIVERY (EXTENDED, SAFE)
 // ===============================
 app.post("/store/orders", requireAuth, async (req, res, next) => {
   try {
@@ -157,8 +212,6 @@ app.post("/store/orders", requireAuth, async (req, res, next) => {
       ]
     );
 
-    const deliveryId = result.insertId;
-
     if (buzz_code || unit || note) {
       await db.query(
         `
@@ -166,18 +219,18 @@ app.post("/store/orders", requireAuth, async (req, res, next) => {
         (delivery_id, buzz_code, unit, note)
         VALUES (?, ?, ?, ?)
         `,
-        [deliveryId, buzz_code, unit, note]
+        [result.insertId, buzz_code, unit, note]
       );
     }
 
-    res.json({ success: true, delivery_id: deliveryId });
+    res.json({ success: true });
   } catch (err) {
     next(err);
   }
 });
 
 // =======================================================
-// DRIVER / OTHER ROUTES UNCHANGED
+// DRIVER (UNCHANGED)
 // =======================================================
 
 // ===============================
