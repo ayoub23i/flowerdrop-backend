@@ -107,12 +107,28 @@ app.post("/login", async (req, res, next) => {
   }
 });
 
+// ===============================
+// ME (optional, helpful)
+// ===============================
+app.get("/me", requireAuth, async (req, res, next) => {
+  try {
+    const [rows] = await db.query(
+      "SELECT id, email, name, phone, role FROM users WHERE id = ?",
+      [req.user.id]
+    );
+    if (!rows.length) return res.status(404).json({ message: "User not found" });
+    res.json(rows[0]);
+  } catch (err) {
+    next(err);
+  }
+});
+
 // =======================================================
 // STORE
 // =======================================================
 
 // ===============================
-// STORE ORDERS
+// STORE ORDERS (store sees proofs + driver)
 // ===============================
 app.get("/store/orders", requireAuth, async (req, res, next) => {
   try {
@@ -129,18 +145,21 @@ app.get("/store/orders", requireAuth, async (req, res, next) => {
     );
 
     for (const d of deliveries) {
+      // proofs
       const [proofs] = await db.query(
         "SELECT image_url FROM delivery_proofs WHERE delivery_id = ? ORDER BY created_at ASC",
         [d.id]
       );
       d.proof_images = proofs.map((p) => p.image_url);
 
+      // instructions (optional)
       const [inst] = await db.query(
-        "SELECT buzz_code, unit, note FROM delivery_instructions WHERE delivery_id = ?",
+        "SELECT buzz_code, unit, note FROM delivery_instructions WHERE delivery_id = ? LIMIT 1",
         [d.id]
       );
-      d.instructions = inst[0] ?? null;
+      d.delivery_instructions = inst[0] ?? null;
 
+      // driver info
       if (d.driver_id) {
         const [rows] = await db.query(
           `
@@ -167,7 +186,7 @@ app.get("/store/orders", requireAuth, async (req, res, next) => {
 });
 
 // ===============================
-// STORE CREATE DELIVERY (EXTENDED, SAFE)
+// STORE CREATE DELIVERY (EXTENDED TO MATCH YOUR DB)
 // ===============================
 app.post("/store/orders", requireAuth, async (req, res, next) => {
   try {
@@ -179,9 +198,11 @@ app.post("/store/orders", requireAuth, async (req, res, next) => {
       recipient_name,
       recipient_phone,
       dropoff_address,
+
       tag_number = null,
-      deliver_before = null,
-      deliver_after = null,
+      deliver_before = null, // "YYYY-MM-DD HH:MM:SS" or ISO string
+      deliver_after = null,  // "YYYY-MM-DD HH:MM:SS" or ISO string
+
       buzz_code = null,
       unit = null,
       note = null,
@@ -197,29 +218,30 @@ app.post("/store/orders", requireAuth, async (req, res, next) => {
     const [result] = await db.query(
       `
       INSERT INTO deliveries
-      (store_id, recipient_name, recipient_phone, dropoff_address, pickup_address,
-       tag_number, deliver_before, deliver_after, status)
+      (store_id, recipient_name, recipient_phone, tag_number,
+       pickup_address, dropoff_address, deliver_after, deliver_before, status)
       VALUES (?, ?, ?, ?, 'STORE PICKUP', ?, ?, ?, 'CREATED')
       `,
       [
         storeId,
         recipient_name,
         recipient_phone,
-        dropoff_address,
         tag_number,
-        deliver_before,
+        dropoff_address,
         deliver_after,
+        deliver_before,
       ]
     );
+
+    const deliveryId = result.insertId;
 
     if (buzz_code || unit || note) {
       await db.query(
         `
-        INSERT INTO delivery_instructions
-        (delivery_id, buzz_code, unit, note)
+        INSERT INTO delivery_instructions (delivery_id, buzz_code, unit, note)
         VALUES (?, ?, ?, ?)
         `,
-        [result.insertId, buzz_code, unit, note]
+        [deliveryId, buzz_code, unit, note]
       );
     }
 
@@ -229,9 +251,273 @@ app.post("/store/orders", requireAuth, async (req, res, next) => {
   }
 });
 
+// ===============================
+// STORE UPDATE STATUS: CREATED->PREPARING->READY_FOR_PICKUP
+// ===============================
+app.put("/store/orders/:id/status", requireAuth, async (req, res, next) => {
+  try {
+    if (req.user.role !== "STORE") {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    const { status } = req.body || {};
+    const allowed = ["PREPARING", "READY_FOR_PICKUP"];
+    if (!allowed.includes(status)) {
+      return res.status(400).json({ message: "Invalid store status" });
+    }
+
+    const storeId = await getStoreId(req.user.id);
+    if (!storeId) return res.status(400).json({ message: "Store not found" });
+
+    const [current] = await db.query(
+      "SELECT status FROM deliveries WHERE id = ? AND store_id = ?",
+      [req.params.id, storeId]
+    );
+    if (!current.length) return res.status(404).json({ message: "Delivery not found" });
+
+    const cur = current[0].status;
+
+    // enforce transition
+    if (
+      (cur === "CREATED" && status !== "PREPARING") ||
+      (cur === "PREPARING" && status !== "READY_FOR_PICKUP")
+    ) {
+      return res.status(400).json({
+        message: `Invalid transition from ${cur} to ${status}`,
+      });
+    }
+
+    await db.query(
+      "UPDATE deliveries SET status = ? WHERE id = ? AND store_id = ?",
+      [status, req.params.id, storeId]
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ===============================
+// STORE DELETE DELIVERY (only early stages)
+// ===============================
+app.delete("/store/orders/:id", requireAuth, async (req, res, next) => {
+  try {
+    if (req.user.role !== "STORE") {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    const storeId = await getStoreId(req.user.id);
+    if (!storeId) return res.status(400).json({ message: "Store not found" });
+
+    const [result] = await db.query(
+      `DELETE FROM deliveries
+       WHERE id = ? AND store_id = ?
+       AND status IN ('CREATED','PREPARING')`,
+      [req.params.id, storeId]
+    );
+
+    if (result.affectedRows === 0) {
+      return res.status(400).json({ message: "Cannot delete delivery at this stage" });
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // =======================================================
-// DRIVER (UNCHANGED)
+// DRIVER
 // =======================================================
+
+// ===============================
+// DRIVER ORDERS (driver sees store; also sees available jobs)
+// ===============================
+app.get("/driver/orders", requireAuth, async (req, res, next) => {
+  try {
+    if (req.user.role !== "DRIVER") {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    const driverId = await getDriverId(req.user.id);
+    if (!driverId) return res.status(400).json({ message: "Driver not found" });
+
+    // show available + assigned-to-me in progress
+    const [deliveries] = await db.query(
+      `
+      SELECT * FROM deliveries
+      WHERE status IN ('READY_FOR_PICKUP','ACCEPTED','PICKED_UP')
+        AND (driver_id IS NULL OR driver_id = ?)
+      ORDER BY created_at DESC
+      `,
+      [driverId]
+    );
+
+    for (const d of deliveries) {
+      // store info (stores -> users)
+      const [rows] = await db.query(
+        `
+        SELECT s.id, u.name, u.phone
+        FROM stores s
+        JOIN users u ON u.id = s.user_id
+        WHERE s.id = ?
+        `,
+        [d.store_id]
+      );
+
+      d.store = rows.length
+        ? { id: rows[0].id, name: rows[0].name, phone: rows[0].phone }
+        : null;
+    }
+
+    res.json(deliveries);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ===============================
+// DRIVER UPLOAD PROOF (max 2 total per delivery)
+// ===============================
+app.post("/driver/orders/:id/proof", requireAuth, async (req, res, next) => {
+  try {
+    if (req.user.role !== "DRIVER") {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    const { image_url } = req.body || {};
+    if (!image_url) return res.status(400).json({ message: "image_url is required" });
+
+    const driverId = await getDriverId(req.user.id);
+    if (!driverId) return res.status(400).json({ message: "Driver not found" });
+
+    // must be assigned to this driver and picked up
+    const [eligible] = await db.query(
+      "SELECT id FROM deliveries WHERE id=? AND driver_id=? AND status='PICKED_UP'",
+      [req.params.id, driverId]
+    );
+    if (!eligible.length) {
+      return res.status(400).json({ message: "Delivery not eligible for proof upload" });
+    }
+
+    // count existing
+    const [[countRow]] = await db.query(
+      `
+      SELECT COUNT(*) AS count
+      FROM delivery_proofs
+      WHERE delivery_id = ?
+        AND uploaded_by = 'DRIVER'
+      `,
+      [req.params.id]
+    );
+
+    if (countRow.count >= 2) {
+      return res.status(400).json({ message: "Maximum of 2 proof photos allowed" });
+    }
+
+    await db.query(
+      `INSERT INTO delivery_proofs (delivery_id, image_url, uploaded_by, created_at)
+       VALUES (?, ?, 'DRIVER', NOW())`,
+      [req.params.id, image_url]
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ===============================
+// DRIVER UPDATE STATUS (enforce transitions + min 2 proofs for DELIVERED)
+// ===============================
+app.put("/driver/orders/:id/status", requireAuth, async (req, res, next) => {
+  try {
+    if (req.user.role !== "DRIVER") {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    const { status } = req.body || {};
+    const allowed = ["ACCEPTED", "PICKED_UP", "DELIVERED"];
+    if (!allowed.includes(status)) {
+      return res.status(400).json({ message: "Invalid driver status" });
+    }
+
+    const driverId = await getDriverId(req.user.id);
+    if (!driverId) return res.status(400).json({ message: "Driver not found" });
+
+    const [cur] = await db.query(
+      "SELECT status, driver_id FROM deliveries WHERE id = ?",
+      [req.params.id]
+    );
+    if (!cur.length) return res.status(404).json({ message: "Delivery not found" });
+
+    const currentStatus = cur[0].status;
+    const currentDriver = cur[0].driver_id;
+
+    // ACCEPTED: only if READY_FOR_PICKUP and unassigned
+    if (status === "ACCEPTED") {
+      if (currentStatus !== "READY_FOR_PICKUP") {
+        return res.status(400).json({ message: "Not ready for pickup" });
+      }
+
+      await db.query(
+        "UPDATE deliveries SET status='ACCEPTED', driver_id=? WHERE id=?",
+        [driverId, req.params.id]
+      );
+      return res.json({ success: true });
+    }
+
+    // below: must be my delivery
+    if (currentDriver !== driverId) {
+      return res.status(403).json({ message: "Not your delivery" });
+    }
+
+    // PICKED_UP: only if ACCEPTED
+    if (status === "PICKED_UP") {
+      if (currentStatus !== "ACCEPTED") {
+        return res.status(400).json({ message: "Must be ACCEPTED first" });
+      }
+
+      await db.query(
+        "UPDATE deliveries SET status='PICKED_UP' WHERE id=? AND driver_id=?",
+        [req.params.id, driverId]
+      );
+      return res.json({ success: true });
+    }
+
+    // DELIVERED: only if PICKED_UP and proofs>=2
+    if (status === "DELIVERED") {
+      if (currentStatus !== "PICKED_UP") {
+        return res.status(400).json({ message: "Must be PICKED_UP first" });
+      }
+
+      const [[row]] = await db.query(
+        `
+        SELECT COUNT(*) AS count
+        FROM delivery_proofs
+        WHERE delivery_id = ?
+          AND uploaded_by = 'DRIVER'
+        `,
+        [req.params.id]
+      );
+
+      if (row.count < 2) {
+        return res.status(400).json({ message: "2 proof photos are required before delivery" });
+      }
+
+      await db.query(
+        "UPDATE deliveries SET status='DELIVERED' WHERE id=? AND driver_id=?",
+        [req.params.id, driverId]
+      );
+      return res.json({ success: true });
+    }
+
+    res.status(400).json({ message: "Invalid status transition" });
+  } catch (err) {
+    next(err);
+  }
+});
 
 // ===============================
 // GLOBAL ERROR HANDLER
