@@ -107,10 +107,6 @@ app.post("/login", async (req, res, next) => {
   }
 });
 
-// =======================================================
-// STORE
-// =======================================================
-
 // ===============================
 // STORE ORDERS
 // ===============================
@@ -135,6 +131,7 @@ app.get("/store/orders", requireAuth, async (req, res, next) => {
       );
       d.proof_images = proofs.map((p) => p.image_url);
 
+      // ✅ FIXED: correct key for Flutter
       const [inst] = await db.query(
         "SELECT buzz_code, unit, note FROM delivery_instructions WHERE delivery_id = ? LIMIT 1",
         [d.id]
@@ -158,104 +155,6 @@ app.get("/store/orders", requireAuth, async (req, res, next) => {
       } else {
         d.driver = null;
       }
-    }
-
-    res.json(deliveries);
-  } catch (err) {
-    next(err);
-  }
-});
-
-// ===============================
-// STORE CREATE DELIVERY
-// ===============================
-app.post("/store/orders", requireAuth, async (req, res, next) => {
-  try {
-    if (req.user.role !== "STORE") {
-      return res.status(403).json({ message: "Forbidden" });
-    }
-
-    const {
-      recipient_name,
-      recipient_phone,
-      dropoff_address,
-      tag_number = null,
-      deliver_before = null,
-      deliver_after = null,
-      buzz_code = null,
-      unit = null,
-      note = null,
-    } = req.body || {};
-
-    const storeId = await getStoreId(req.user.id);
-    if (!storeId) return res.status(400).json({ message: "Store not found" });
-
-    const [result] = await db.query(
-      `
-      INSERT INTO deliveries
-      (store_id, recipient_name, recipient_phone, tag_number,
-       pickup_address, dropoff_address, deliver_after, deliver_before, status)
-      VALUES (?, ?, ?, ?, 'STORE PICKUP', ?, ?, ?, 'CREATED')
-      `,
-      [
-        storeId,
-        recipient_name,
-        recipient_phone,
-        tag_number,
-        dropoff_address,
-        deliver_after,
-        deliver_before,
-      ]
-    );
-
-    if (buzz_code || unit || note) {
-      await db.query(
-        `
-        INSERT INTO delivery_instructions (delivery_id, buzz_code, unit, note)
-        VALUES (?, ?, ?, ?)
-        `,
-        [result.insertId, buzz_code, unit, note]
-      );
-    }
-
-    res.json({ success: true });
-  } catch (err) {
-    next(err);
-  }
-});
-
-// =======================================================
-// DRIVER
-// =======================================================
-
-// ===============================
-// DRIVER ORDERS
-// ===============================
-app.get("/driver/orders", requireAuth, async (req, res, next) => {
-  try {
-    if (req.user.role !== "DRIVER") {
-      return res.status(403).json({ message: "Forbidden" });
-    }
-
-    const driverId = await getDriverId(req.user.id);
-    if (!driverId) return res.status(400).json({ message: "Driver not found" });
-
-    const [deliveries] = await db.query(
-      `
-      SELECT * FROM deliveries
-      WHERE status IN ('READY_FOR_PICKUP','ACCEPTED','PICKED_UP')
-        AND (driver_id IS NULL OR driver_id = ?)
-      ORDER BY created_at DESC
-      `,
-      [driverId]
-    );
-
-    for (const d of deliveries) {
-      const [inst] = await db.query(
-        "SELECT buzz_code, unit, note FROM delivery_instructions WHERE delivery_id = ? LIMIT 1",
-        [d.id]
-      );
-      d.instructions = inst[0] ?? null;
     }
 
     res.json(deliveries);
