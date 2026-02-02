@@ -80,12 +80,14 @@ async function getDriverId(userId) {
 }
 
 // ===============================
-// PUSH HELPER
+// PUSH HELPERS
 // ===============================
-async function sendPushToUser(userId, title, body, data = {}) {
+async function sendPushToUsers(userIds, title, body, data = {}) {
+  if (!userIds.length) return;
+
   const [rows] = await db.query(
-    "SELECT fcm_token FROM user_devices WHERE user_id = ?",
-    [userId]
+    `SELECT fcm_token FROM user_devices WHERE user_id IN (?)`,
+    [userIds]
   );
 
   if (!rows.length) return;
@@ -101,6 +103,10 @@ async function sendPushToUser(userId, title, body, data = {}) {
   });
 }
 
+async function sendPushToUser(userId, title, body, data = {}) {
+  await sendPushToUsers([userId], title, body, data);
+}
+
 // ===============================
 // HEALTH
 // ===============================
@@ -113,7 +119,7 @@ app.get("/", (req, res) => {
 // ===============================
 app.post("/login", async (req, res, next) => {
   try {
-    const { email, password } = req.body || {};
+    const { email, password } = req.body;
 
     const [rows] = await db.query(
       "SELECT id, role, password_hash FROM users WHERE email = ?",
@@ -174,7 +180,66 @@ app.post("/me/device", requireAuth, async (req, res, next) => {
 });
 
 // =======================================================
-// DRIVER STATUS UPDATE + NOTIFICATIONS
+// STORE UPDATE STATUS → NOTIFY DRIVERS
+// =======================================================
+app.put("/store/orders/:id/status", requireAuth, async (req, res, next) => {
+  try {
+    if (req.user.role !== "STORE") {
+      return res.status(403).json({ message: "Forbidden" });
+    }
+
+    const { status } = req.body;
+    const storeId = await getStoreId(req.user.id);
+
+    const [[delivery]] = await db.query(
+      "SELECT * FROM deliveries WHERE id = ? AND store_id = ?",
+      [req.params.id, storeId]
+    );
+
+    if (!delivery) return res.status(404).json({ message: "Not found" });
+
+    // CREATED → PREPARING
+    if (delivery.status === "CREATED" && status === "PREPARING") {
+      await db.query(
+        "UPDATE deliveries SET status='PREPARING' WHERE id=?",
+        [delivery.id]
+      );
+    }
+
+    // PREPARING → READY_FOR_PICKUP (🔥 notify drivers)
+    if (delivery.status === "PREPARING" && status === "READY_FOR_PICKUP") {
+      await db.query(
+        "UPDATE deliveries SET status='READY_FOR_PICKUP' WHERE id=?",
+        [delivery.id]
+      );
+
+      // get ALL drivers' user_ids
+      const [drivers] = await db.query(
+        `
+        SELECT u.id AS user_id
+        FROM drivers d
+        JOIN users u ON u.id = d.user_id
+        `
+      );
+
+      const driverUserIds = drivers.map(d => d.user_id);
+
+      await sendPushToUsers(
+        driverUserIds,
+        "📦 New delivery available",
+        "A store has a delivery ready for pickup",
+        { deliveryId: delivery.id }
+      );
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// =======================================================
+// DRIVER STATUS UPDATE → NOTIFY STORE
 // =======================================================
 app.put("/driver/orders/:id/status", requireAuth, async (req, res, next) => {
   try {
@@ -192,16 +257,16 @@ app.put("/driver/orders/:id/status", requireAuth, async (req, res, next) => {
 
     if (!delivery) return res.status(404).json({ message: "Not found" });
 
+    const [[store]] = await db.query(
+      "SELECT user_id FROM stores WHERE id = ?",
+      [delivery.store_id]
+    );
+
     // ACCEPTED
     if (status === "ACCEPTED" && delivery.status === "READY_FOR_PICKUP") {
       await db.query(
         "UPDATE deliveries SET status='ACCEPTED', driver_id=? WHERE id=?",
         [driverId, delivery.id]
-      );
-
-      const [[store]] = await db.query(
-        "SELECT user_id FROM stores WHERE id = ?",
-        [delivery.store_id]
       );
 
       await sendPushToUser(
@@ -219,11 +284,6 @@ app.put("/driver/orders/:id/status", requireAuth, async (req, res, next) => {
         [delivery.id]
       );
 
-      const [[store]] = await db.query(
-        "SELECT user_id FROM stores WHERE id = ?",
-        [delivery.store_id]
-      );
-
       await sendPushToUser(
         store.user_id,
         "📦 Order picked up",
@@ -237,11 +297,6 @@ app.put("/driver/orders/:id/status", requireAuth, async (req, res, next) => {
       await db.query(
         "UPDATE deliveries SET status='DELIVERED' WHERE id=?",
         [delivery.id]
-      );
-
-      const [[store]] = await db.query(
-        "SELECT user_id FROM stores WHERE id = ?",
-        [delivery.store_id]
       );
 
       await sendPushToUser(
