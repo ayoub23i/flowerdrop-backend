@@ -5,12 +5,24 @@ const express = require("express");
 const cors = require("cors");
 const jwt = require("jsonwebtoken");
 const mysql = require("mysql2/promise");
+const admin = require("firebase-admin");
 
 // ===============================
 // CONFIG
 // ===============================
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET;
+
+// ===============================
+// FIREBASE ADMIN INIT
+// ===============================
+if (!admin.apps.length) {
+  const serviceAccount = JSON.parse(process.env.FIREBASE_ADMIN_JSON);
+
+  admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+  });
+}
 
 // ===============================
 // APP SETUP
@@ -40,10 +52,6 @@ function requireAuth(req, res, next) {
     const auth = req.headers.authorization;
     if (!auth) return res.status(401).json({ message: "Missing token" });
 
-    if (!JWT_SECRET) {
-      return res.status(500).json({ message: "JWT_SECRET not set" });
-    }
-
     const token = auth.split(" ")[1];
     req.user = jwt.verify(token, JWT_SECRET);
     next();
@@ -72,6 +80,28 @@ async function getDriverId(userId) {
 }
 
 // ===============================
+// PUSH HELPER
+// ===============================
+async function sendPushToUser(userId, title, body, data = {}) {
+  const [rows] = await db.query(
+    "SELECT fcm_token FROM user_devices WHERE user_id = ?",
+    [userId]
+  );
+
+  if (!rows.length) return;
+
+  const tokens = rows.map(r => r.fcm_token);
+
+  await admin.messaging().sendEachForMulticast({
+    tokens,
+    notification: { title, body },
+    data: Object.fromEntries(
+      Object.entries(data).map(([k, v]) => [k, String(v)])
+    ),
+  });
+}
+
+// ===============================
 // HEALTH
 // ===============================
 app.get("/", (req, res) => {
@@ -84,16 +114,13 @@ app.get("/", (req, res) => {
 app.post("/login", async (req, res, next) => {
   try {
     const { email, password } = req.body || {};
-    if (!email || !password) {
-      return res.status(400).json({ message: "Missing credentials" });
-    }
 
     const [rows] = await db.query(
       "SELECT id, role, password_hash FROM users WHERE email = ?",
       [email]
     );
 
-    if (!rows.length || password !== (rows[0].password_hash || "").trim()) {
+    if (!rows.length || password !== rows[0].password_hash) {
       return res.status(401).json({ message: "Invalid credentials" });
     }
 
@@ -118,9 +145,6 @@ app.get("/me", requireAuth, async (req, res, next) => {
       "SELECT id, email, name, phone, role FROM users WHERE id = ?",
       [req.user.id]
     );
-    if (!rows.length) {
-      return res.status(404).json({ message: "User not found" });
-    }
     res.json(rows[0]);
   } catch (err) {
     next(err);
@@ -128,15 +152,11 @@ app.get("/me", requireAuth, async (req, res, next) => {
 });
 
 // ===============================
-// REGISTER DEVICE FOR PUSH (FCM)
+// REGISTER DEVICE (FCM)
 // ===============================
 app.post("/me/device", requireAuth, async (req, res, next) => {
   try {
-    const { fcm_token, platform = "android" } = req.body || {};
-
-    if (!fcm_token) {
-      return res.status(400).json({ message: "fcm_token is required" });
-    }
+    const { fcm_token, platform = "android" } = req.body;
 
     await db.query(
       `
@@ -154,88 +174,85 @@ app.post("/me/device", requireAuth, async (req, res, next) => {
 });
 
 // =======================================================
-// STORE
+// DRIVER STATUS UPDATE + NOTIFICATIONS
 // =======================================================
-
-// ===============================
-// STORE ORDERS
-// ===============================
-app.get("/store/orders", requireAuth, async (req, res, next) => {
-  try {
-    if (req.user.role !== "STORE") {
-      return res.status(403).json({ message: "Forbidden" });
-    }
-
-    const storeId = await getStoreId(req.user.id);
-    if (!storeId) return res.status(400).json({ message: "Store not found" });
-
-    const [deliveries] = await db.query(
-      "SELECT * FROM deliveries WHERE store_id = ? ORDER BY created_at DESC",
-      [storeId]
-    );
-
-    for (const d of deliveries) {
-      const [proofs] = await db.query(
-        "SELECT image_url FROM delivery_proofs WHERE delivery_id = ? ORDER BY created_at ASC",
-        [d.id]
-      );
-      d.proof_images = proofs.map((p) => p.image_url);
-
-      const [inst] = await db.query(
-        "SELECT buzz_code, unit, note FROM delivery_instructions WHERE delivery_id = ? LIMIT 1",
-        [d.id]
-      );
-      d.delivery_instructions = inst[0] ?? null;
-
-      if (d.driver_id) {
-        const [rows] = await db.query(
-          `
-          SELECT dr.id, u.name, u.phone
-          FROM drivers dr
-          JOIN users u ON u.id = dr.user_id
-          WHERE dr.id = ?
-          `,
-          [d.driver_id]
-        );
-
-        d.driver = rows.length
-          ? { id: rows[0].id, name: rows[0].name, phone: rows[0].phone }
-          : null;
-      } else {
-        d.driver = null;
-      }
-    }
-
-    res.json(deliveries);
-  } catch (err) {
-    next(err);
-  }
-});
-
-// =======================================================
-// DRIVER
-// =======================================================
-
-app.get("/driver/orders", requireAuth, async (req, res, next) => {
+app.put("/driver/orders/:id/status", requireAuth, async (req, res, next) => {
   try {
     if (req.user.role !== "DRIVER") {
       return res.status(403).json({ message: "Forbidden" });
     }
 
+    const { status } = req.body;
     const driverId = await getDriverId(req.user.id);
-    if (!driverId) return res.status(400).json({ message: "Driver not found" });
 
-    const [deliveries] = await db.query(
-      `
-      SELECT * FROM deliveries
-      WHERE status IN ('READY_FOR_PICKUP','ACCEPTED','PICKED_UP')
-        AND (driver_id IS NULL OR driver_id = ?)
-      ORDER BY created_at DESC
-      `,
-      [driverId]
+    const [[delivery]] = await db.query(
+      "SELECT * FROM deliveries WHERE id = ?",
+      [req.params.id]
     );
 
-    res.json(deliveries);
+    if (!delivery) return res.status(404).json({ message: "Not found" });
+
+    // ACCEPTED
+    if (status === "ACCEPTED" && delivery.status === "READY_FOR_PICKUP") {
+      await db.query(
+        "UPDATE deliveries SET status='ACCEPTED', driver_id=? WHERE id=?",
+        [driverId, delivery.id]
+      );
+
+      const [[store]] = await db.query(
+        "SELECT user_id FROM stores WHERE id = ?",
+        [delivery.store_id]
+      );
+
+      await sendPushToUser(
+        store.user_id,
+        "🚗 Driver accepted",
+        "A driver accepted your delivery",
+        { deliveryId: delivery.id }
+      );
+    }
+
+    // PICKED_UP
+    if (status === "PICKED_UP" && delivery.status === "ACCEPTED") {
+      await db.query(
+        "UPDATE deliveries SET status='PICKED_UP' WHERE id=?",
+        [delivery.id]
+      );
+
+      const [[store]] = await db.query(
+        "SELECT user_id FROM stores WHERE id = ?",
+        [delivery.store_id]
+      );
+
+      await sendPushToUser(
+        store.user_id,
+        "📦 Order picked up",
+        "Your order is on the way",
+        { deliveryId: delivery.id }
+      );
+    }
+
+    // DELIVERED
+    if (status === "DELIVERED" && delivery.status === "PICKED_UP") {
+      await db.query(
+        "UPDATE deliveries SET status='DELIVERED' WHERE id=?",
+        [delivery.id]
+      );
+
+      const [[store]] = await db.query(
+        "SELECT user_id FROM stores WHERE id = ?",
+        [delivery.store_id]
+      );
+
+      await sendPushToUser(
+        store.user_id,
+        "✅ Delivery completed",
+        "The delivery was completed successfully",
+        { deliveryId: delivery.id }
+      );
+    }
+
+    res.json({ success: true });
   } catch (err) {
     next(err);
   }
@@ -246,7 +263,7 @@ app.get("/driver/orders", requireAuth, async (req, res, next) => {
 // ===============================
 app.use((err, req, res, next) => {
   console.error("❌ API ERROR:", err);
-  res.status(500).json({ message: err.message || "Internal server error" });
+  res.status(500).json({ message: err.message });
 });
 
 // ===============================
