@@ -770,6 +770,59 @@ app.get("/geo/autocomplete", requireAuth, async (req, res, next) => {
   }
 });
 
+// ===============================
+// ADDRESS RESOLUTION (CONFIRM FLOW - GTA)
+// ===============================
+app.post("/geo/resolve", requireAuth, async (req, res, next) => {
+  try {
+    const { query } = req.body || {};
+
+    if (!query || query.length < 3) {
+      return res.json([]);
+    }
+
+    const url =
+      "https://nominatim.openstreetmap.org/search?" +
+      `q=${encodeURIComponent(query)}` +
+      "&format=json" +
+      "&addressdetails=1" +
+      "&limit=8" +
+      "&countrycodes=ca" +
+      // GTA bounding box (Toronto + Scarborough + Markham + Mississauga etc.)
+      "&viewbox=-79.9000,43.9500,-79.1000,43.5000" +
+      "&bounded=1";
+
+    const resp = await fetch(url, {
+      headers: { "User-Agent": NOMINATIM_UA },
+    });
+
+    if (!resp.ok) {
+      throw new Error("Address resolution failed");
+    }
+
+    const data = await resp.json();
+
+    const results = data.map((r) => ({
+      label: [
+        r.address?.house_number,
+        r.address?.road,
+        r.address?.suburb ||
+          r.address?.city ||
+          r.address?.town,
+        r.address?.state,
+        r.address?.postcode,
+      ]
+        .filter(Boolean)
+        .join(", "),
+      lat: Number(r.lat),
+      lng: Number(r.lon),
+    }));
+
+    res.json(results);
+  } catch (err) {
+    next(err);
+  }
+});
 
 // ===============================
 // GLOBAL ERROR HANDLER
