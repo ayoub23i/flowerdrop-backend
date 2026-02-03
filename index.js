@@ -718,6 +718,9 @@ app.put("/driver/orders/:id/status", requireAuth, async (req, res, next) => {
 // ===============================
 // ADDRESS AUTOCOMPLETE (FREE - PHOTON)
 // ===============================
+// ===============================
+// ADDRESS AUTOCOMPLETE (EXACT - NOMINATIM)
+// ===============================
 app.get("/geo/autocomplete", requireAuth, async (req, res, next) => {
   try {
     const { q } = req.query;
@@ -725,12 +728,17 @@ app.get("/geo/autocomplete", requireAuth, async (req, res, next) => {
       return res.json([]);
     }
 
-    // Toronto center bias
+    // Toronto bounding box (west, north, east, south)
+    // Limits results strictly to Toronto
     const url =
-      "https://photon.komoot.io/api/?" +
+      "https://nominatim.openstreetmap.org/search?" +
       `q=${encodeURIComponent(q)}` +
+      "&format=json" +
+      "&addressdetails=1" +
       "&limit=5" +
-      "&lat=43.6532&lon=-79.3832";
+      "&countrycodes=ca" +
+      "&viewbox=-79.6393,43.8555,-79.1150,43.5810" +
+      "&bounded=1";
 
     const resp = await fetch(url, {
       headers: { "User-Agent": NOMINATIM_UA },
@@ -742,24 +750,26 @@ app.get("/geo/autocomplete", requireAuth, async (req, res, next) => {
 
     const data = await resp.json();
 
-    const results = (data.features || [])
-      .filter(f => f.properties?.city === "Toronto")
-      .map(f => ({
-        label: [
-          f.properties.name,
-          f.properties.street,
-          f.properties.city,
-          f.properties.postcode,
-        ].filter(Boolean).join(", "),
-        lat: f.geometry.coordinates[1],
-        lng: f.geometry.coordinates[0],
-      }));
+    const results = data.map((r) => ({
+      label: [
+        r.address?.house_number,
+        r.address?.road,
+        r.address?.city || r.address?.town,
+        r.address?.state,
+        r.address?.postcode,
+      ]
+        .filter(Boolean)
+        .join(", "),
+      lat: Number(r.lat),
+      lng: Number(r.lon),
+    }));
 
     res.json(results);
   } catch (err) {
     next(err);
   }
 });
+
 
 // ===============================
 // GLOBAL ERROR HANDLER
