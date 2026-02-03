@@ -716,6 +716,52 @@ app.put("/driver/orders/:id/status", requireAuth, async (req, res, next) => {
 });
 
 // ===============================
+// ADDRESS AUTOCOMPLETE (FREE - PHOTON)
+// ===============================
+app.get("/geo/autocomplete", requireAuth, async (req, res, next) => {
+  try {
+    const { q } = req.query;
+    if (!q || q.length < 3) {
+      return res.json([]);
+    }
+
+    // Toronto center bias
+    const url =
+      "https://photon.komoot.io/api/?" +
+      `q=${encodeURIComponent(q)}` +
+      "&limit=5" +
+      "&lat=43.6532&lon=-79.3832";
+
+    const resp = await fetch(url, {
+      headers: { "User-Agent": NOMINATIM_UA },
+    });
+
+    if (!resp.ok) {
+      throw new Error("Autocomplete service failed");
+    }
+
+    const data = await resp.json();
+
+    const results = (data.features || [])
+      .filter(f => f.properties?.city === "Toronto")
+      .map(f => ({
+        label: [
+          f.properties.name,
+          f.properties.street,
+          f.properties.city,
+          f.properties.postcode,
+        ].filter(Boolean).join(", "),
+        lat: f.geometry.coordinates[1],
+        lng: f.geometry.coordinates[0],
+      }));
+
+    res.json(results);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// ===============================
 // GLOBAL ERROR HANDLER
 // ===============================
 app.use((err, req, res, next) => {
