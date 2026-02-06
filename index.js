@@ -219,6 +219,72 @@ async function getStorePickup(storeId) {
 }
 
 // ===============================
+// PRICING ENGINE (SINGLE SOURCE OF TRUTH)
+// ===============================
+const BASE_PRICE = 7.99; // covers first 4 km
+const INCLUDED_KM = 4.0;
+const EXTRA_KM_RATE = 0.8;
+const RUSH_FEE = 3.0;
+
+function isRushHour(date) {
+  const t = date.getHours() + date.getMinutes() / 60;
+  return (t >= 7 && t <= 8.5) || (t >= 16 && t <= 18.5);
+}
+
+function calculatePrice(distanceKm, deliverBefore, deliverAfter) {
+  const extraKm = Math.max(0, distanceKm - INCLUDED_KM);
+  const extraDistancePrice = extraKm * EXTRA_KM_RATE;
+
+  // ANY => now, otherwise use requested time (before/after)
+  let effectiveDate = new Date();
+
+  if (deliverBefore) effectiveDate = new Date(deliverBefore);
+  if (deliverAfter) effectiveDate = new Date(deliverAfter);
+
+  const rush = isRushHour(effectiveDate);
+
+  const total =
+    BASE_PRICE + extraDistancePrice + (rush ? RUSH_FEE : 0);
+
+  return {
+    base_price: Number(BASE_PRICE.toFixed(2)),
+    included_km: INCLUDED_KM,
+    extra_km: Number(extraKm.toFixed(2)),
+    extra_km_rate: EXTRA_KM_RATE,
+    extra_distance_price: Number(extraDistancePrice.toFixed(2)),
+    rush_fee: rush ? RUSH_FEE : 0,
+    rush_applied: rush,
+    total_price: Number(total.toFixed(2)),
+  };
+}
+
+// Try to update price columns if they exist; ignore if schema not updated yet.
+async function trySavePricing(deliveryId, pricing) {
+  try {
+    await db.query(
+      `
+      UPDATE deliveries
+      SET
+        base_price = ?,
+        extra_distance_price = ?,
+        rush_fee = ?,
+        total_price = ?
+      WHERE id = ?
+      `,
+      [
+        pricing.base_price,
+        pricing.extra_distance_price,
+        pricing.rush_fee,
+        pricing.total_price,
+        deliveryId,
+      ]
+    );
+  } catch {
+    // columns probably don't exist yet — safe ignore
+  }
+}
+
+// ===============================
 // HEALTH
 // ===============================
 app.get("/", (req, res) => {
@@ -301,13 +367,15 @@ app.post("/me/device", requireAuth, async (req, res, next) => {
 // STORE
 // =======================================================
 
-// PREVIEW (NEW) - distance + ETA before creating order
+// PREVIEW (distance + ETA + PRICE) before creating order
 app.post("/store/orders/preview", requireAuth, async (req, res, next) => {
   try {
     if (req.user.role !== "STORE")
       return res.status(403).json({ message: "Forbidden" });
 
-    const { dropoff_address } = req.body || {};
+    const { dropoff_address, deliver_before = null, deliver_after = null } =
+      req.body || {};
+
     if (!dropoff_address) {
       return res.status(400).json({ message: "dropoff_address required" });
     }
@@ -325,9 +393,13 @@ app.post("/store/orders/preview", requireAuth, async (req, res, next) => {
       drop.lng
     );
 
+    const pricing = calculatePrice(distanceKm, deliver_before, deliver_after);
+
     res.json({
       distance_km: Number(distanceKm.toFixed(2)),
       eta_minutes: estimateEtaMinutes(distanceKm),
+      ...pricing,
+
       pickup_address: pickup.pickup_address,
       pickup_lat: pickup.pickup_lat,
       pickup_lng: pickup.pickup_lng,
@@ -388,7 +460,7 @@ app.get("/store/orders", requireAuth, async (req, res, next) => {
   }
 });
 
-// STORE CREATE DELIVERY (FULL + GEO SAVE)
+// STORE CREATE DELIVERY (FULL + GEO SAVE + PRICE SAVE)
 app.post("/store/orders", requireAuth, async (req, res, next) => {
   try {
     if (req.user.role !== "STORE")
@@ -429,9 +501,10 @@ app.post("/store/orders", requireAuth, async (req, res, next) => {
     );
     const etaMinutes = estimateEtaMinutes(distanceKm);
 
-    // INSERT delivery (includes geo fields if columns exist in your schema)
-    // Your schema (from your summary) includes:
-    // pickup_address, pickup_lat, pickup_lng, dropoff_address, dropoff_lat, dropoff_lng, distance_km, eta_minutes, deliver_before, deliver_after, status
+    // Calculate pricing (same engine as preview)
+    const pricing = calculatePrice(distanceKm, deliver_before, deliver_after);
+
+    // INSERT delivery
     const [result] = await db.query(
       `
       INSERT INTO deliveries
@@ -473,6 +546,9 @@ app.post("/store/orders", requireAuth, async (req, res, next) => {
       ]
     );
 
+    // Save pricing if columns exist
+    await trySavePricing(result.insertId, pricing);
+
     if (buzz_code || unit || note) {
       await db.query(
         `
@@ -488,6 +564,7 @@ app.post("/store/orders", requireAuth, async (req, res, next) => {
       id: result.insertId,
       distance_km: Number(distanceKm.toFixed(2)),
       eta_minutes: etaMinutes,
+      ...pricing,
     });
   } catch (err) {
     next(err);
@@ -716,9 +793,6 @@ app.put("/driver/orders/:id/status", requireAuth, async (req, res, next) => {
 });
 
 // ===============================
-// ADDRESS AUTOCOMPLETE (FREE - PHOTON)
-// ===============================
-// ===============================
 // ADDRESS AUTOCOMPLETE (EXACT - NOMINATIM)
 // ===============================
 app.get("/geo/autocomplete", requireAuth, async (req, res, next) => {
@@ -728,8 +802,6 @@ app.get("/geo/autocomplete", requireAuth, async (req, res, next) => {
       return res.json([]);
     }
 
-    // Toronto bounding box (west, north, east, south)
-    // Limits results strictly to Toronto
     const url =
       "https://nominatim.openstreetmap.org/search?" +
       `q=${encodeURIComponent(q)}` +
@@ -788,7 +860,6 @@ app.post("/geo/resolve", requireAuth, async (req, res, next) => {
       "&addressdetails=1" +
       "&limit=8" +
       "&countrycodes=ca" +
-      // GTA bounding box (Toronto + Scarborough + Markham + Mississauga etc.)
       "&viewbox=-79.9000,43.9500,-79.1000,43.5000" +
       "&bounded=1";
 
@@ -806,9 +877,7 @@ app.post("/geo/resolve", requireAuth, async (req, res, next) => {
       label: [
         r.address?.house_number,
         r.address?.road,
-        r.address?.suburb ||
-          r.address?.city ||
-          r.address?.town,
+        r.address?.suburb || r.address?.city || r.address?.town,
         r.address?.state,
         r.address?.postcode,
       ]
