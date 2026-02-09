@@ -13,12 +13,15 @@ const admin = require("firebase-admin");
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET;
 
-// Mapbox geocoding (production)
+// Mapbox token (Geocoding + Directions)
 const MAPBOX_TOKEN = process.env.MAPBOX_TOKEN;
 
 // Toronto bias (better local accuracy)
 const TORONTO_BIAS_LNG = -79.3832;
 const TORONTO_BIAS_LAT = 43.6532;
+
+// Optional: if your runtime doesn't have fetch (Node < 18), uncomment the next line.
+// const fetch = (...args) => import("node-fetch").then(({ default: fetch }) => fetch(...args));
 
 // ===============================
 // FIREBASE ADMIN INIT (SAFE)
@@ -126,10 +129,10 @@ async function sendPushToUser(userId, title, body, data = {}) {
 }
 
 // ===============================
-// GEO HELPERS (FREE) + HAVERSINE
+// GEO HELPERS (LEGACY SAFE KEEP)
 // ===============================
 
-// Soft rate limit for Nominatim (~1 request/sec per user)
+// Soft rate limit (legacy; kept so nothing is removed)
 const _geoLastCall = new Map();
 function geoRateLimit(userId) {
   const now = Date.now();
@@ -150,7 +153,11 @@ function assertMapbox() {
   }
 }
 
-async function geocodeAddress(address) {
+// ===============================
+// MAPBOX GEOCODING (PRODUCTION)
+// ===============================
+// NOTE: userId parameter kept (even if not used) so your older calls remain valid.
+async function geocodeAddress(address, userId = null) {
   assertMapbox();
 
   if (!address || !address.trim()) {
@@ -185,6 +192,42 @@ async function geocodeAddress(address) {
   return { lat: Number(lat), lng: Number(lng) };
 }
 
+// ===============================
+// MAPBOX DIRECTIONS (REAL DISTANCE + ETA)
+// ===============================
+async function getRouteDistanceAndEtaKm(pickupLat, pickupLng, dropLat, dropLng) {
+  assertMapbox();
+
+  const url =
+    `https://api.mapbox.com/directions/v5/mapbox/driving/` +
+    `${pickupLng},${pickupLat};${dropLng},${dropLat}` +
+    `?overview=false&access_token=${MAPBOX_TOKEN}`;
+
+  const resp = await fetch(url);
+  if (!resp.ok) {
+    const err = new Error("Mapbox Directions failed");
+    err.statusCode = 502;
+    throw err;
+  }
+
+  const data = await resp.json();
+  if (!data.routes || !data.routes.length) {
+    const err = new Error("No route found");
+    err.statusCode = 400;
+    throw err;
+  }
+
+  const route = data.routes[0];
+
+  return {
+    distanceKm: route.distance / 1000, // meters → km
+    etaMinutes: Math.max(1, Math.round(route.duration / 60)), // seconds → minutes
+  };
+}
+
+// ===============================
+// LEGACY DISTANCE HELPERS (KEEP)
+// ===============================
 function haversineKm(lat1, lng1, lat2, lng2) {
   const R = 6371;
   const toRad = (v) => (v * Math.PI) / 180;
@@ -202,10 +245,13 @@ function haversineKm(lat1, lng1, lat2, lng2) {
 }
 
 function estimateEtaMinutes(distanceKm) {
-  const avgSpeedKmh = 25; // simple Toronto avg
+  const avgSpeedKmh = 25; // legacy fallback
   return Math.max(5, Math.round((distanceKm / avgSpeedKmh) * 60));
 }
 
+// ===============================
+// STORE PICKUP
+// ===============================
 async function getStorePickup(storeId) {
   const [[store]] = await db.query(
     "SELECT address, lat, lng FROM stores WHERE id = ?",
@@ -241,79 +287,57 @@ function isRushHour(date) {
   return (t >= 7 && t <= 8.5) || (t >= 16 && t <= 18.5);
 }
 
-/**
- * FINAL FORMULA (base + profit cap + extra to driver)
- *
- * Step 1 — Base driver
- * if km <= 2: driver = 6
- * elif km <= 4: driver = 8
- * else: driver = 8 + (km − 4)
- *
- * Step 2 — Profit with cap
- * profit_raw = 4 + 0.12 × km
- * profit = min(profit_raw, 5)
- *
- * Step 3 — Give extra to driver
- * if profit_raw > 5: driver += (profit_raw − 5)
- *
- * Step 4 — Store price
- * store = driver + profit
- *
- * Rush fee (optional layer): if rush, store += 3
- */
 function calculatePrice(distanceKm, deliverBefore, deliverAfter) {
   const km = Math.max(0, Number(distanceKm || 0));
 
-  // --- pick effective datetime (same behavior as your current code) ---
   let effectiveDate = new Date();
   if (deliverBefore) effectiveDate = new Date(deliverBefore);
   if (deliverAfter) effectiveDate = new Date(deliverAfter);
 
   const rush = isRushHour(effectiveDate);
 
-  // ---- Step 1: base driver ----
+  // Step 1 — Base driver
   let driver;
   if (km <= 2) driver = 6;
   else if (km <= 4) driver = 8;
   else driver = 8 + (km - 4);
 
-  // ---- Step 2: profit with cap ----
+  // Step 2 — Profit with cap
   const profitRaw = 4 + 0.12 * km;
   const profit = Math.min(profitRaw, 5);
 
-  // ---- Step 3: extra above cap goes to driver ----
+  // Step 3 — Give extra above cap to driver
   if (profitRaw > 5) {
-    driver += (profitRaw - 5);
+    driver += profitRaw - 5;
   }
 
-  // ---- Step 4: store price ----
+  // Step 4 — Store price
   let store = driver + profit;
 
-  // ---- Rush layer (adds to store) ----
+  // Rush layer (adds to store)
   const rushFee = rush ? RUSH_FEE : 0;
   store += rushFee;
 
   return {
-    // new clear fields
     driver_price: Number(driver.toFixed(2)),
     platform_profit: Number(profit.toFixed(2)),
     profit_raw: Number(profitRaw.toFixed(2)),
     store_price: Number(store.toFixed(2)),
 
-    // keep your existing fields (backward compatible for Flutter)
-    base_price: Number(driver.toFixed(2)), // map driver payout here for now
-    extra_distance_price: Number(0).toFixed ? 0 : 0, // kept for compatibility (not used anymore)
+    // backward compatible fields
+    base_price: Number(driver.toFixed(2)),
+    extra_distance_price: 0,
     rush_fee: Number(rushFee.toFixed(2)),
     rush_applied: rush,
-
-    // keep old naming too
     total_price: Number(store.toFixed(2)),
   };
 }
 
-// Try to update price columns if they exist; ignore if schema not updated yet.
+// ===============================
+// SAVE PRICING (PRIMARY) — DO NOT REMOVE
+// ===============================
 async function trySavePricing(deliveryId, pricing) {
-  // 1) Always update the existing columns you already have
+  // 1) Always update existing columns (you already have these)
   try {
     await db.query(
       `
@@ -327,7 +351,7 @@ async function trySavePricing(deliveryId, pricing) {
       `,
       [
         pricing.base_price,
-        0, // extra_distance_price no longer used
+        0,
         pricing.rush_fee,
         pricing.total_price,
         deliveryId,
@@ -358,13 +382,15 @@ async function trySavePricing(deliveryId, pricing) {
       ]
     );
   } catch {
-    // columns probably not added yet — safe ignore
+    // ignore if columns don't exist
   }
 }
 
-
-// Try to update price columns if they exist; ignore if schema not updated yet.
-async function trySavePricing(deliveryId, pricing) {
+// ===============================
+// SAVE PRICING (LEGACY COPY) — KEPT, BUT RENAMED
+// (Your previous duplicate trySavePricing was overriding the real one.)
+// ===============================
+async function trySavePricing_LEGACY_DO_NOT_USE(deliveryId, pricing) {
   try {
     await db.query(
       `
@@ -385,7 +411,7 @@ async function trySavePricing(deliveryId, pricing) {
       ]
     );
   } catch {
-    // columns probably don't exist yet — safe ignore
+    // ignore
   }
 }
 
@@ -491,18 +517,22 @@ app.post("/store/orders/preview", requireAuth, async (req, res, next) => {
     const pickup = await getStorePickup(storeId);
     const drop = await geocodeAddress(dropoff_address, req.user.id);
 
-    const distanceKm = haversineKm(
+    const route = await getRouteDistanceAndEtaKm(
       pickup.pickup_lat,
       pickup.pickup_lng,
       drop.lat,
       drop.lng
     );
 
-    const pricing = calculatePrice(distanceKm, deliver_before, deliver_after);
+    const pricing = calculatePrice(
+      route.distanceKm,
+      deliver_before,
+      deliver_after
+    );
 
     res.json({
-      distance_km: Number(distanceKm.toFixed(2)),
-      eta_minutes: estimateEtaMinutes(distanceKm),
+      distance_km: Number(route.distanceKm.toFixed(2)),
+      eta_minutes: route.etaMinutes,
       ...pricing,
 
       pickup_address: pickup.pickup_address,
@@ -592,24 +622,22 @@ app.post("/store/orders", requireAuth, async (req, res, next) => {
     const storeId = await getStoreId(req.user.id);
     if (!storeId) return res.status(400).json({ message: "Store not found" });
 
-    // pickup from stores table
     const pickup = await getStorePickup(storeId);
-
-    // dropoff geocode (free)
     const drop = await geocodeAddress(dropoff_address, req.user.id);
 
-    const distanceKm = haversineKm(
+    const route = await getRouteDistanceAndEtaKm(
       pickup.pickup_lat,
       pickup.pickup_lng,
       drop.lat,
       drop.lng
     );
-    const etaMinutes = estimateEtaMinutes(distanceKm);
 
-    // Calculate pricing (same engine as preview)
-    const pricing = calculatePrice(distanceKm, deliver_before, deliver_after);
+    const pricing = calculatePrice(
+      route.distanceKm,
+      deliver_before,
+      deliver_after
+    );
 
-    // INSERT delivery
     const [result] = await db.query(
       `
       INSERT INTO deliveries
@@ -644,14 +672,13 @@ app.post("/store/orders", requireAuth, async (req, res, next) => {
         dropoff_address,
         drop.lat,
         drop.lng,
-        Number(distanceKm.toFixed(2)),
-        etaMinutes,
+        Number(route.distanceKm.toFixed(2)),
+        route.etaMinutes,
         deliver_after,
         deliver_before,
       ]
     );
 
-    // Save pricing if columns exist
     await trySavePricing(result.insertId, pricing);
 
     if (buzz_code || unit || note) {
@@ -667,8 +694,8 @@ app.post("/store/orders", requireAuth, async (req, res, next) => {
     res.json({
       success: true,
       id: result.insertId,
-      distance_km: Number(distanceKm.toFixed(2)),
-      eta_minutes: etaMinutes,
+      distance_km: Number(route.distanceKm.toFixed(2)),
+      eta_minutes: route.etaMinutes,
       ...pricing,
     });
   } catch (err) {
@@ -692,14 +719,12 @@ app.put("/store/orders/:id/status", requireAuth, async (req, res, next) => {
 
     if (!delivery) return res.status(404).json({ message: "Not found" });
 
-    // CREATED → PREPARING
     if (delivery.status === "CREATED" && status === "PREPARING") {
       await db.query("UPDATE deliveries SET status='PREPARING' WHERE id=?", [
         delivery.id,
       ]);
     }
 
-    // PREPARING → READY_FOR_PICKUP (notify drivers)
     if (delivery.status === "PREPARING" && status === "READY_FOR_PICKUP") {
       await db.query(
         "UPDATE deliveries SET status='READY_FOR_PICKUP' WHERE id=?",
@@ -725,7 +750,7 @@ app.put("/store/orders/:id/status", requireAuth, async (req, res, next) => {
   }
 });
 
-// STORE DELETE DELIVERY (needed by Flutter)
+// STORE DELETE DELIVERY
 app.delete("/store/orders/:id", requireAuth, async (req, res, next) => {
   try {
     if (req.user.role !== "STORE")
@@ -740,14 +765,12 @@ app.delete("/store/orders/:id", requireAuth, async (req, res, next) => {
     );
     if (!delivery) return res.status(404).json({ message: "Not found" });
 
-    // simple safety: allow delete only before accepted
     if (["ACCEPTED", "PICKED_UP", "DELIVERED"].includes(delivery.status)) {
       return res
         .status(400)
         .json({ message: "Cannot delete after driver accepted" });
     }
 
-    // delete children first if your DB does not cascade
     await db.query("DELETE FROM delivery_proofs WHERE delivery_id=?", [
       deliveryId,
     ]);
@@ -801,7 +824,8 @@ app.post("/driver/orders/:id/proof", requireAuth, async (req, res, next) => {
       return res.status(403).json({ message: "Forbidden" });
 
     const { image_url } = req.body || {};
-    if (!image_url) return res.status(400).json({ message: "image_url required" });
+    if (!image_url)
+      return res.status(400).json({ message: "image_url required" });
 
     const driverId = await getDriverId(req.user.id);
 
@@ -851,7 +875,6 @@ app.put("/driver/orders/:id/status", requireAuth, async (req, res, next) => {
       delivery.store_id,
     ]);
 
-    // ACCEPTED (only from READY_FOR_PICKUP)
     if (status === "ACCEPTED" && delivery.status === "READY_FOR_PICKUP") {
       await db.query(
         "UPDATE deliveries SET status='ACCEPTED', driver_id=? WHERE id=?",
@@ -865,7 +888,6 @@ app.put("/driver/orders/:id/status", requireAuth, async (req, res, next) => {
       );
     }
 
-    // PICKED_UP (only from ACCEPTED)
     if (status === "PICKED_UP" && delivery.status === "ACCEPTED") {
       await db.query("UPDATE deliveries SET status='PICKED_UP' WHERE id=?", [
         delivery.id,
@@ -878,7 +900,6 @@ app.put("/driver/orders/:id/status", requireAuth, async (req, res, next) => {
       );
     }
 
-    // DELIVERED (only from PICKED_UP)
     if (status === "DELIVERED" && delivery.status === "PICKED_UP") {
       await db.query("UPDATE deliveries SET status='DELIVERED' WHERE id=?", [
         delivery.id,
@@ -970,7 +991,6 @@ app.post("/geo/resolve", requireAuth, async (req, res, next) => {
     next(err);
   }
 });
-
 
 // ===============================
 // GLOBAL ERROR HANDLER
