@@ -388,7 +388,6 @@ async function trySavePricing(deliveryId, pricing) {
 
 // ===============================
 // SAVE PRICING (LEGACY COPY) — KEPT, BUT RENAMED
-// (Your previous duplicate trySavePricing was overriding the real one.)
 // ===============================
 async function trySavePricing_LEGACY_DO_NOT_USE(deliveryId, pricing) {
   try {
@@ -546,8 +545,12 @@ app.post("/store/orders/preview", requireAuth, async (req, res, next) => {
   }
 });
 
-// STORE ORDERS (LIST)
-// STORE ORDERS (FAST PRODUCTION VERSION)
+// STORE ORDERS (LIST) — FIXED:
+// - keeps optimized query
+// - BUT returns JSON exactly like Flutter expects:
+//   driver: {id,name,phone}
+//   delivery_instructions: {buzz_code, unit, note}
+//   proof_images: []
 app.get("/store/orders", requireAuth, async (req, res, next) => {
   try {
     if (req.user.role !== "STORE")
@@ -556,72 +559,86 @@ app.get("/store/orders", requireAuth, async (req, res, next) => {
     const storeId = await getStoreId(req.user.id);
     if (!storeId) return res.status(400).json({ message: "Store not found" });
 
-    // ============================================
-    // SINGLE OPTIMIZED QUERY (NO N+1)
-    // ============================================
-    const [rows] = await db.query(`
+    const [rows] = await db.query(
+      `
       SELECT
         d.*,
 
-        -- Driver info
+        -- Driver info (aliased so we can build driver object)
         dr.id AS driver_id,
         u.name AS driver_name,
         u.phone AS driver_phone,
 
-        -- Instructions
-        di.buzz_code,
-        di.unit,
-        di.note,
+        -- Instructions (aliased)
+        di.buzz_code AS instr_buzz_code,
+        di.unit AS instr_unit,
+        di.note AS instr_note,
 
         -- Proof images aggregated
-        GROUP_CONCAT(dp.image_url ORDER BY dp.created_at SEPARATOR '||') AS proof_images
+        GROUP_CONCAT(dp.image_url ORDER BY dp.created_at SEPARATOR '||') AS proof_images_concat
 
       FROM deliveries d
-
       LEFT JOIN drivers dr ON dr.id = d.driver_id
       LEFT JOIN users u ON u.id = dr.user_id
       LEFT JOIN delivery_instructions di ON di.delivery_id = d.id
       LEFT JOIN delivery_proofs dp ON dp.delivery_id = d.id
-
       WHERE d.store_id = ?
       GROUP BY d.id
       ORDER BY d.created_at DESC
-    `, [storeId]);
+      `,
+      [storeId]
+    );
 
-    // ============================================
-    // FORMAT RESPONSE TO MATCH YOUR FLUTTER MODEL
-    // ============================================
-    const deliveries = rows.map((r) => ({
-      ...r,
+    const deliveries = rows.map((r) => {
+      // Build proof_images as array
+      const proof_images = r.proof_images_concat
+        ? String(r.proof_images_concat).split("||").filter(Boolean)
+        : [];
 
-      proof_images: r.proof_images
-        ? r.proof_images.split("||")
-        : [],
+      // Build delivery_instructions EXACT keys Flutter expects
+      const hasInstr = r.instr_buzz_code || r.instr_unit || r.instr_note;
+      const delivery_instructions = hasInstr
+        ? {
+            buzz_code: r.instr_buzz_code,
+            unit: r.instr_unit,
+            note: r.instr_note,
+          }
+        : null;
 
-      delivery_instructions:
-        r.buzz_code || r.unit || r.note
-          ? {
-              buzzCode: r.buzz_code,
-              unit: r.unit,
-              note: r.note,
-            }
-          : null,
-
-      driver: r.driver_id
+      // Build driver object
+      const driver = r.driver_id
         ? {
             id: r.driver_id,
             name: r.driver_name,
             phone: r.driver_phone,
           }
-        : null,
-    }));
+        : null;
+
+      // Remove helper fields so Flutter doesn't get weird types
+      const {
+        proof_images_concat,
+        instr_buzz_code,
+        instr_unit,
+        instr_note,
+        driver_id,
+        driver_name,
+        driver_phone,
+        ...clean
+      } = r;
+
+      return {
+        ...clean,
+        proof_images,
+        delivery_instructions,
+        driver,
+      };
+    });
 
     res.json(deliveries);
   } catch (err) {
     next(err);
   }
 });
-
 
 // STORE CREATE DELIVERY (FULL + GEO SAVE + PRICE SAVE)
 app.post("/store/orders", requireAuth, async (req, res, next) => {
@@ -731,7 +748,7 @@ app.post("/store/orders", requireAuth, async (req, res, next) => {
   }
 });
 
-// STORE UPDATE STATUS + NOTIFY DRIVERS
+// STORE UPDATE STATUS + NOTIFY DRIVERS — FINAL FLOW FIXED
 app.put("/store/orders/:id/status", requireAuth, async (req, res, next) => {
   try {
     if (req.user.role !== "STORE")
@@ -747,16 +764,13 @@ app.put("/store/orders/:id/status", requireAuth, async (req, res, next) => {
 
     if (!delivery) return res.status(404).json({ message: "Not found" });
 
-    // =====================================================
     // FINAL FLOW: CREATED → READY_FOR_PICKUP (NO PREPARING)
-    // =====================================================
     if (delivery.status === "CREATED" && status === "READY_FOR_PICKUP") {
       await db.query(
         "UPDATE deliveries SET status='READY_FOR_PICKUP' WHERE id=?",
         [delivery.id]
       );
 
-      // notify all drivers that a delivery is available
       const [drivers] = await db.query(
         "SELECT u.id AS user_id FROM drivers d JOIN users u ON u.id = d.user_id"
       );
@@ -818,7 +832,9 @@ app.delete("/store/orders/:id", requireAuth, async (req, res, next) => {
 // DRIVER
 // =======================================================
 
-// DRIVER ORDERS (LIST)
+// DRIVER ORDERS (LIST) — UPDATED to include store info + distance/eta store→dropoff
+// Driver should see store name/address + distance + eta BEFORE pickup
+// After pickup, Flutter can open dropoff in Google Maps (you already have dropoff_address)
 app.get("/driver/orders", requireAuth, async (req, res, next) => {
   try {
     if (req.user.role !== "DRIVER")
@@ -827,15 +843,43 @@ app.get("/driver/orders", requireAuth, async (req, res, next) => {
     const driverId = await getDriverId(req.user.id);
     if (!driverId) return res.status(400).json({ message: "Driver not found" });
 
-    const [deliveries] = await db.query(
+    const [rows] = await db.query(
       `
-      SELECT * FROM deliveries
-      WHERE status IN ('READY_FOR_PICKUP','ACCEPTED','PICKED_UP')
-        AND (driver_id IS NULL OR driver_id = ?)
-      ORDER BY created_at DESC
+      SELECT
+        d.*,
+
+        -- Store info
+        s.id AS store_id,
+        su.name AS store_name,
+        su.phone AS store_phone,
+        s.address AS store_address
+
+      FROM deliveries d
+      JOIN stores s ON s.id = d.store_id
+      JOIN users su ON su.id = s.user_id
+
+      WHERE d.status IN ('READY_FOR_PICKUP','ACCEPTED','PICKED_UP')
+        AND (d.driver_id IS NULL OR d.driver_id = ?)
+
+      ORDER BY d.created_at DESC
       `,
       [driverId]
     );
+
+    // Format to match Flutter model expectations:
+    // store: {id, name, phone}   + keep pickup_address
+    const deliveries = rows.map((r) => {
+      const { store_id, store_name, store_phone, store_address, ...clean } = r;
+
+      return {
+        ...clean,
+        // ensure pickup address is real store address if missing
+        pickup_address: clean.pickup_address || store_address || "Store pickup",
+        store: store_id
+          ? { id: store_id, name: store_name, phone: store_phone }
+          : null,
+      };
+    });
 
     res.json(deliveries);
   } catch (err) {
