@@ -219,11 +219,8 @@ async function getStorePickup(storeId) {
 }
 
 // ===============================
-// PRICING ENGINE (SINGLE SOURCE OF TRUTH)
+// PRICING ENGINE (SINGLE SOURCE OF TRUTH) — FINAL FORMULA
 // ===============================
-const BASE_PRICE = 7.99; // covers first 4 km
-const INCLUDED_KM = 4.0;
-const EXTRA_KM_RATE = 0.8;
 const RUSH_FEE = 3.0;
 
 function isRushHour(date) {
@@ -231,32 +228,127 @@ function isRushHour(date) {
   return (t >= 7 && t <= 8.5) || (t >= 16 && t <= 18.5);
 }
 
+/**
+ * FINAL FORMULA (base + profit cap + extra to driver)
+ *
+ * Step 1 — Base driver
+ * if km <= 2: driver = 6
+ * elif km <= 4: driver = 8
+ * else: driver = 8 + (km − 4)
+ *
+ * Step 2 — Profit with cap
+ * profit_raw = 4 + 0.12 × km
+ * profit = min(profit_raw, 5)
+ *
+ * Step 3 — Give extra to driver
+ * if profit_raw > 5: driver += (profit_raw − 5)
+ *
+ * Step 4 — Store price
+ * store = driver + profit
+ *
+ * Rush fee (optional layer): if rush, store += 3
+ */
 function calculatePrice(distanceKm, deliverBefore, deliverAfter) {
-  const extraKm = Math.max(0, distanceKm - INCLUDED_KM);
-  const extraDistancePrice = extraKm * EXTRA_KM_RATE;
+  const km = Math.max(0, Number(distanceKm || 0));
 
-  // ANY => now, otherwise use requested time (before/after)
+  // --- pick effective datetime (same behavior as your current code) ---
   let effectiveDate = new Date();
-
   if (deliverBefore) effectiveDate = new Date(deliverBefore);
   if (deliverAfter) effectiveDate = new Date(deliverAfter);
 
   const rush = isRushHour(effectiveDate);
 
-  const total =
-    BASE_PRICE + extraDistancePrice + (rush ? RUSH_FEE : 0);
+  // ---- Step 1: base driver ----
+  let driver;
+  if (km <= 2) driver = 6;
+  else if (km <= 4) driver = 8;
+  else driver = 8 + (km - 4);
+
+  // ---- Step 2: profit with cap ----
+  const profitRaw = 4 + 0.12 * km;
+  const profit = Math.min(profitRaw, 5);
+
+  // ---- Step 3: extra above cap goes to driver ----
+  if (profitRaw > 5) {
+    driver += (profitRaw - 5);
+  }
+
+  // ---- Step 4: store price ----
+  let store = driver + profit;
+
+  // ---- Rush layer (adds to store) ----
+  const rushFee = rush ? RUSH_FEE : 0;
+  store += rushFee;
 
   return {
-    base_price: Number(BASE_PRICE.toFixed(2)),
-    included_km: INCLUDED_KM,
-    extra_km: Number(extraKm.toFixed(2)),
-    extra_km_rate: EXTRA_KM_RATE,
-    extra_distance_price: Number(extraDistancePrice.toFixed(2)),
-    rush_fee: rush ? RUSH_FEE : 0,
+    // new clear fields
+    driver_price: Number(driver.toFixed(2)),
+    platform_profit: Number(profit.toFixed(2)),
+    profit_raw: Number(profitRaw.toFixed(2)),
+    store_price: Number(store.toFixed(2)),
+
+    // keep your existing fields (backward compatible for Flutter)
+    base_price: Number(driver.toFixed(2)), // map driver payout here for now
+    extra_distance_price: Number(0).toFixed ? 0 : 0, // kept for compatibility (not used anymore)
+    rush_fee: Number(rushFee.toFixed(2)),
     rush_applied: rush,
-    total_price: Number(total.toFixed(2)),
+
+    // keep old naming too
+    total_price: Number(store.toFixed(2)),
   };
 }
+
+// Try to update price columns if they exist; ignore if schema not updated yet.
+async function trySavePricing(deliveryId, pricing) {
+  // 1) Always update the existing columns you already have
+  try {
+    await db.query(
+      `
+      UPDATE deliveries
+      SET
+        base_price = ?,
+        extra_distance_price = ?,
+        rush_fee = ?,
+        total_price = ?
+      WHERE id = ?
+      `,
+      [
+        pricing.base_price,
+        0, // extra_distance_price no longer used
+        pricing.rush_fee,
+        pricing.total_price,
+        deliveryId,
+      ]
+    );
+  } catch {
+    // ignore
+  }
+
+  // 2) Update new columns if you added them
+  try {
+    await db.query(
+      `
+      UPDATE deliveries
+      SET
+        driver_price = ?,
+        platform_profit = ?,
+        profit_raw = ?,
+        store_price = ?
+      WHERE id = ?
+      `,
+      [
+        pricing.driver_price,
+        pricing.platform_profit,
+        pricing.profit_raw,
+        pricing.store_price,
+        deliveryId,
+      ]
+    );
+  } catch {
+    // columns probably not added yet — safe ignore
+  }
+}
+
 
 // Try to update price columns if they exist; ignore if schema not updated yet.
 async function trySavePricing(deliveryId, pricing) {
