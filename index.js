@@ -13,9 +13,12 @@ const admin = require("firebase-admin");
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET;
 
-// Nominatim (free geocoding) User-Agent
-const NOMINATIM_UA =
-  process.env.NOMINATIM_UA || "FlowerDrop/1.0 (contact: you@email.com)";
+// Mapbox geocoding (production)
+const MAPBOX_TOKEN = process.env.MAPBOX_TOKEN;
+
+// Toronto bias (better local accuracy)
+const TORONTO_BIAS_LNG = -79.3832;
+const TORONTO_BIAS_LAT = 43.6532;
 
 // ===============================
 // FIREBASE ADMIN INIT (SAFE)
@@ -139,37 +142,47 @@ function geoRateLimit(userId) {
   _geoLastCall.set(userId, now);
 }
 
-async function geocodeAddressFree(address, userId) {
+function assertMapbox() {
+  if (!MAPBOX_TOKEN) {
+    const err = new Error("MAPBOX_TOKEN not set");
+    err.statusCode = 500;
+    throw err;
+  }
+}
+
+async function geocodeAddress(address) {
+  assertMapbox();
+
   if (!address || !address.trim()) {
     const err = new Error("dropoff_address required");
     err.statusCode = 400;
     throw err;
   }
 
-  geoRateLimit(String(userId));
-
   const url =
-    "https://nominatim.openstreetmap.org/search" +
-    `?q=${encodeURIComponent(address)}&format=json&limit=1`;
+    `https://api.mapbox.com/geocoding/v5/mapbox.places/` +
+    `${encodeURIComponent(address)}.json` +
+    `?access_token=${MAPBOX_TOKEN}` +
+    `&country=ca` +
+    `&limit=1` +
+    `&proximity=${TORONTO_BIAS_LNG},${TORONTO_BIAS_LAT}`;
 
-  const resp = await fetch(url, {
-    headers: { "User-Agent": NOMINATIM_UA },
-  });
-
+  const resp = await fetch(url);
   if (!resp.ok) {
-    const err = new Error("Geocoding failed");
+    const err = new Error("Mapbox geocoding failed");
     err.statusCode = 502;
     throw err;
   }
 
   const data = await resp.json();
-  if (!Array.isArray(data) || !data.length) {
+  if (!data.features || !data.features.length) {
     const err = new Error("Address not found");
     err.statusCode = 400;
     throw err;
   }
 
-  return { lat: Number(data[0].lat), lng: Number(data[0].lon) };
+  const [lng, lat] = data.features[0].center;
+  return { lat: Number(lat), lng: Number(lng) };
 }
 
 function haversineKm(lat1, lng1, lat2, lng2) {
@@ -476,7 +489,7 @@ app.post("/store/orders/preview", requireAuth, async (req, res, next) => {
     if (!storeId) return res.status(400).json({ message: "Store not found" });
 
     const pickup = await getStorePickup(storeId);
-    const drop = await geocodeAddressFree(dropoff_address, req.user.id);
+    const drop = await geocodeAddress(dropoff_address, req.user.id);
 
     const distanceKm = haversineKm(
       pickup.pickup_lat,
@@ -583,7 +596,7 @@ app.post("/store/orders", requireAuth, async (req, res, next) => {
     const pickup = await getStorePickup(storeId);
 
     // dropoff geocode (free)
-    const drop = await geocodeAddressFree(dropoff_address, req.user.id);
+    const drop = await geocodeAddress(dropoff_address, req.user.id);
 
     const distanceKm = haversineKm(
       pickup.pickup_lat,
@@ -885,47 +898,34 @@ app.put("/driver/orders/:id/status", requireAuth, async (req, res, next) => {
 });
 
 // ===============================
-// ADDRESS AUTOCOMPLETE (EXACT - NOMINATIM)
+// ADDRESS AUTOCOMPLETE (MAPBOX)
 // ===============================
 app.get("/geo/autocomplete", requireAuth, async (req, res, next) => {
   try {
+    assertMapbox();
+
     const { q } = req.query;
-    if (!q || q.length < 3) {
-      return res.json([]);
-    }
+    if (!q || q.length < 3) return res.json([]);
 
     const url =
-      "https://nominatim.openstreetmap.org/search?" +
-      `q=${encodeURIComponent(q)}` +
-      "&format=json" +
-      "&addressdetails=1" +
-      "&limit=5" +
-      "&countrycodes=ca" +
-      "&viewbox=-79.6393,43.8555,-79.1150,43.5810" +
-      "&bounded=1";
+      `https://api.mapbox.com/geocoding/v5/mapbox.places/` +
+      `${encodeURIComponent(q)}.json` +
+      `?access_token=${MAPBOX_TOKEN}` +
+      `&country=ca` +
+      `&types=address,place,postcode` +
+      `&autocomplete=true` +
+      `&limit=6` +
+      `&proximity=${TORONTO_BIAS_LNG},${TORONTO_BIAS_LAT}`;
 
-    const resp = await fetch(url, {
-      headers: { "User-Agent": NOMINATIM_UA },
-    });
-
-    if (!resp.ok) {
-      throw new Error("Autocomplete service failed");
-    }
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error("Autocomplete failed");
 
     const data = await resp.json();
 
-    const results = data.map((r) => ({
-      label: [
-        r.address?.house_number,
-        r.address?.road,
-        r.address?.city || r.address?.town,
-        r.address?.state,
-        r.address?.postcode,
-      ]
-        .filter(Boolean)
-        .join(", "),
-      lat: Number(r.lat),
-      lng: Number(r.lon),
+    const results = (data.features || []).map((f) => ({
+      label: f.place_name,
+      lat: Number(f.center?.[1]),
+      lng: Number(f.center?.[0]),
     }));
 
     res.json(results);
@@ -935,48 +935,34 @@ app.get("/geo/autocomplete", requireAuth, async (req, res, next) => {
 });
 
 // ===============================
-// ADDRESS RESOLUTION (CONFIRM FLOW - GTA)
+// ADDRESS RESOLUTION (MAPBOX)
 // ===============================
 app.post("/geo/resolve", requireAuth, async (req, res, next) => {
   try {
-    const { query } = req.body || {};
+    assertMapbox();
 
-    if (!query || query.length < 3) {
-      return res.json([]);
-    }
+    const { query } = req.body || {};
+    if (!query || query.length < 3) return res.json([]);
 
     const url =
-      "https://nominatim.openstreetmap.org/search?" +
-      `q=${encodeURIComponent(query)}` +
-      "&format=json" +
-      "&addressdetails=1" +
-      "&limit=8" +
-      "&countrycodes=ca" +
-      "&viewbox=-79.9000,43.9500,-79.1000,43.5000" +
-      "&bounded=1";
+      `https://api.mapbox.com/geocoding/v5/mapbox.places/` +
+      `${encodeURIComponent(query)}.json` +
+      `?access_token=${MAPBOX_TOKEN}` +
+      `&country=ca` +
+      `&types=address,place,postcode` +
+      `&autocomplete=true` +
+      `&limit=8` +
+      `&proximity=${TORONTO_BIAS_LNG},${TORONTO_BIAS_LAT}`;
 
-    const resp = await fetch(url, {
-      headers: { "User-Agent": NOMINATIM_UA },
-    });
-
-    if (!resp.ok) {
-      throw new Error("Address resolution failed");
-    }
+    const resp = await fetch(url);
+    if (!resp.ok) throw new Error("Resolve failed");
 
     const data = await resp.json();
 
-    const results = data.map((r) => ({
-      label: [
-        r.address?.house_number,
-        r.address?.road,
-        r.address?.suburb || r.address?.city || r.address?.town,
-        r.address?.state,
-        r.address?.postcode,
-      ]
-        .filter(Boolean)
-        .join(", "),
-      lat: Number(r.lat),
-      lng: Number(r.lon),
+    const results = (data.features || []).map((f) => ({
+      label: f.place_name,
+      lat: Number(f.center?.[1]),
+      lng: Number(f.center?.[0]),
     }));
 
     res.json(results);
@@ -984,6 +970,7 @@ app.post("/geo/resolve", requireAuth, async (req, res, next) => {
     next(err);
   }
 });
+
 
 // ===============================
 // GLOBAL ERROR HANDLER
