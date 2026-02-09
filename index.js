@@ -547,6 +547,7 @@ app.post("/store/orders/preview", requireAuth, async (req, res, next) => {
 });
 
 // STORE ORDERS (LIST)
+// STORE ORDERS (FAST PRODUCTION VERSION)
 app.get("/store/orders", requireAuth, async (req, res, next) => {
   try {
     if (req.user.role !== "STORE")
@@ -555,45 +556,72 @@ app.get("/store/orders", requireAuth, async (req, res, next) => {
     const storeId = await getStoreId(req.user.id);
     if (!storeId) return res.status(400).json({ message: "Store not found" });
 
-    const [deliveries] = await db.query(
-      "SELECT * FROM deliveries WHERE store_id = ? ORDER BY created_at DESC",
-      [storeId]
-    );
+    // ============================================
+    // SINGLE OPTIMIZED QUERY (NO N+1)
+    // ============================================
+    const [rows] = await db.query(`
+      SELECT
+        d.*,
 
-    for (const d of deliveries) {
-      const [proofs] = await db.query(
-        "SELECT image_url FROM delivery_proofs WHERE delivery_id = ? ORDER BY created_at ASC",
-        [d.id]
-      );
-      d.proof_images = proofs.map((p) => p.image_url);
+        -- Driver info
+        dr.id AS driver_id,
+        u.name AS driver_name,
+        u.phone AS driver_phone,
 
-      const [inst] = await db.query(
-        "SELECT buzz_code, unit, note FROM delivery_instructions WHERE delivery_id = ? LIMIT 1",
-        [d.id]
-      );
-      d.delivery_instructions = inst[0] ?? null;
+        -- Instructions
+        di.buzz_code,
+        di.unit,
+        di.note,
 
-      if (d.driver_id) {
-        const [rows] = await db.query(
-          `
-          SELECT dr.id, u.name, u.phone
-          FROM drivers dr
-          JOIN users u ON u.id = dr.user_id
-          WHERE dr.id = ?
-          `,
-          [d.driver_id]
-        );
-        d.driver = rows[0] ?? null;
-      } else {
-        d.driver = null;
-      }
-    }
+        -- Proof images aggregated
+        GROUP_CONCAT(dp.image_url ORDER BY dp.created_at SEPARATOR '||') AS proof_images
+
+      FROM deliveries d
+
+      LEFT JOIN drivers dr ON dr.id = d.driver_id
+      LEFT JOIN users u ON u.id = dr.user_id
+      LEFT JOIN delivery_instructions di ON di.delivery_id = d.id
+      LEFT JOIN delivery_proofs dp ON dp.delivery_id = d.id
+
+      WHERE d.store_id = ?
+      GROUP BY d.id
+      ORDER BY d.created_at DESC
+    `, [storeId]);
+
+    // ============================================
+    // FORMAT RESPONSE TO MATCH YOUR FLUTTER MODEL
+    // ============================================
+    const deliveries = rows.map((r) => ({
+      ...r,
+
+      proof_images: r.proof_images
+        ? r.proof_images.split("||")
+        : [],
+
+      delivery_instructions:
+        r.buzz_code || r.unit || r.note
+          ? {
+              buzzCode: r.buzz_code,
+              unit: r.unit,
+              note: r.note,
+            }
+          : null,
+
+      driver: r.driver_id
+        ? {
+            id: r.driver_id,
+            name: r.driver_name,
+            phone: r.driver_phone,
+          }
+        : null,
+    }));
 
     res.json(deliveries);
   } catch (err) {
     next(err);
   }
 });
+
 
 // STORE CREATE DELIVERY (FULL + GEO SAVE + PRICE SAVE)
 app.post("/store/orders", requireAuth, async (req, res, next) => {
