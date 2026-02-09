@@ -719,18 +719,16 @@ app.put("/store/orders/:id/status", requireAuth, async (req, res, next) => {
 
     if (!delivery) return res.status(404).json({ message: "Not found" });
 
-    if (delivery.status === "CREATED" && status === "PREPARING") {
-      await db.query("UPDATE deliveries SET status='PREPARING' WHERE id=?", [
-        delivery.id,
-      ]);
-    }
-
-    if (delivery.status === "PREPARING" && status === "READY_FOR_PICKUP") {
+    // =====================================================
+    // FINAL FLOW: CREATED → READY_FOR_PICKUP (NO PREPARING)
+    // =====================================================
+    if (delivery.status === "CREATED" && status === "READY_FOR_PICKUP") {
       await db.query(
         "UPDATE deliveries SET status='READY_FOR_PICKUP' WHERE id=?",
         [delivery.id]
       );
 
+      // notify all drivers that a delivery is available
       const [drivers] = await db.query(
         "SELECT u.id AS user_id FROM drivers d JOIN users u ON u.id = d.user_id"
       );
