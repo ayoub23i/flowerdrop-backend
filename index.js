@@ -543,10 +543,13 @@ app.post("/store/orders/preview", requireAuth, async (req, res, next) => {
     next(err);
   }
 });
-
+//-------------------------------------------------
 
 // ===============================
 // GET STORE ORDERS (FAST + SAFE)
+// ===============================
+// ===============================
+// GET STORE ORDERS (FIXED + SAFE)
 // ===============================
 app.get("/store/orders", requireAuth, async (req, res, next) => {
   try {
@@ -561,6 +564,7 @@ app.get("/store/orders", requireAuth, async (req, res, next) => {
       SELECT
         d.*,
 
+        -- DRIVER
         CASE
           WHEN dr.id IS NULL THEN NULL
           ELSE JSON_OBJECT(
@@ -570,6 +574,7 @@ app.get("/store/orders", requireAuth, async (req, res, next) => {
           )
         END AS driver,
 
+        -- INSTRUCTIONS
         CASE
           WHEN di.delivery_id IS NULL THEN NULL
           ELSE JSON_OBJECT(
@@ -579,8 +584,9 @@ app.get("/store/orders", requireAuth, async (req, res, next) => {
           )
         END AS delivery_instructions,
 
+        -- PROOF IMAGES (FIXED: no DISTINCT)
         COALESCE(
-          JSON_ARRAYAGG(DISTINCT dp.image_url),
+          JSON_ARRAYAGG(dp.image_url),
           JSON_ARRAY()
         ) AS proof_images
 
@@ -597,6 +603,7 @@ app.get("/store/orders", requireAuth, async (req, res, next) => {
       [storeId]
     );
 
+    // Safe JSON parsing
     for (const d of rows) {
       if (typeof d.driver === "string") d.driver = JSON.parse(d.driver);
       if (typeof d.delivery_instructions === "string")
@@ -610,6 +617,7 @@ app.get("/store/orders", requireAuth, async (req, res, next) => {
     next(err);
   }
 });
+
 
 
 // ===============================
