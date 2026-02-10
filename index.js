@@ -290,41 +290,58 @@ function isRushHour(date) {
 function calculatePrice(distanceKm, deliverBefore, deliverAfter) {
   const km = Math.max(0, Number(distanceKm || 0));
 
-  let effectiveDate = new Date();
+  // ✅ IMPORTANT: rush ONLY if store selected a time
+  const hasTimeConstraint = Boolean(deliverBefore || deliverAfter);
+
+  let effectiveDate = null;
   if (deliverBefore) effectiveDate = new Date(deliverBefore);
   if (deliverAfter) effectiveDate = new Date(deliverAfter);
 
-  const rush = isRushHour(effectiveDate);
+  const rush =
+    hasTimeConstraint && effectiveDate ? isRushHour(effectiveDate) : false;
 
+  // ===============================
   // Step 1 — Base driver
+  // ===============================
   let driver;
   if (km <= 2) driver = 6;
   else if (km <= 4) driver = 8;
   else driver = 8 + (km - 4);
 
+  // ===============================
   // Step 2 — Profit with cap
+  // ===============================
   const profitRaw = 4 + 0.12 * km;
   const profit = Math.min(profitRaw, 5);
 
+  // ===============================
   // Step 3 — Give extra above cap to driver
+  // ===============================
   if (profitRaw > 5) {
     driver += profitRaw - 5;
   }
 
-  // Step 4 — Store price
-  let store = driver + profit;
+  // ===============================
+  // Step 4 — Store base price (NO rush)
+  // ===============================
+  const baseStore = driver + profit;
 
-  // Rush layer (adds to store)
+  // ===============================
+  // Rush layer (ONLY when time selected)
+  // ===============================
   const rushFee = rush ? RUSH_FEE : 0;
-  store += rushFee;
+  const store = baseStore + rushFee;
 
   return {
     driver_price: Number(driver.toFixed(2)),
     platform_profit: Number(profit.toFixed(2)),
     profit_raw: Number(profitRaw.toFixed(2)),
+
+    // ✅ NEW clean separation
+    base_store_price: Number(baseStore.toFixed(2)),
     store_price: Number(store.toFixed(2)),
 
-    // backward compatible fields
+    // backward compatibility
     base_price: Number(driver.toFixed(2)),
     extra_distance_price: 0,
     rush_fee: Number(rushFee.toFixed(2)),
