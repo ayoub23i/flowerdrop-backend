@@ -497,8 +497,57 @@ app.post("/me/device", requireAuth, async (req, res, next) => {
 // STORE
 // =======================================================
 
-// PREVIEW (distance + ETA + PRICE) before creating order
-// GET ORDERS — FAST + SAFE + NO DATA LOSS
+// =======================================================
+// STORE
+// =======================================================
+
+// ===============================
+// PREVIEW (distance + ETA + PRICE)
+// ===============================
+app.post("/store/orders/preview", requireAuth, async (req, res, next) => {
+  try {
+    if (req.user.role !== "STORE")
+      return res.status(403).json({ message: "Forbidden" });
+
+    const { dropoff_address, deliver_before = null, deliver_after = null } =
+      req.body || {};
+
+    if (!dropoff_address)
+      return res.status(400).json({ message: "dropoff_address required" });
+
+    const storeId = await getStoreId(req.user.id);
+    if (!storeId) return res.status(400).json({ message: "Store not found" });
+
+    const pickup = await getStorePickup(storeId);
+    const drop = await geocodeAddress(dropoff_address);
+
+    const route = await getRouteDistanceAndEtaKm(
+      pickup.pickup_lat,
+      pickup.pickup_lng,
+      drop.lat,
+      drop.lng
+    );
+
+    const pricing = calculatePrice(
+      route.distanceKm,
+      deliver_before,
+      deliver_after
+    );
+
+    res.json({
+      distance_km: Number(route.distanceKm.toFixed(2)),
+      eta_minutes: route.etaMinutes,
+      ...pricing,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+
+// ===============================
+// GET STORE ORDERS (FAST + SAFE)
+// ===============================
 app.get("/store/orders", requireAuth, async (req, res, next) => {
   try {
     if (req.user.role !== "STORE")
@@ -512,49 +561,42 @@ app.get("/store/orders", requireAuth, async (req, res, next) => {
       SELECT
         d.*,
 
-        -- DRIVER (safe subquery)
-        (
-          SELECT JSON_OBJECT(
+        CASE
+          WHEN dr.id IS NULL THEN NULL
+          ELSE JSON_OBJECT(
             'id', dr.id,
             'name', u.name,
             'phone', u.phone
           )
-          FROM drivers dr
-          JOIN users u ON u.id = dr.user_id
-          WHERE dr.id = d.driver_id
-          LIMIT 1
-        ) AS driver,
+        END AS driver,
 
-        -- INSTRUCTIONS (safe subquery)
-        (
-          SELECT JSON_OBJECT(
+        CASE
+          WHEN di.delivery_id IS NULL THEN NULL
+          ELSE JSON_OBJECT(
             'buzz_code', di.buzz_code,
             'unit', di.unit,
             'note', di.note
           )
-          FROM delivery_instructions di
-          WHERE di.delivery_id = d.id
-          LIMIT 1
-        ) AS delivery_instructions,
+        END AS delivery_instructions,
 
-        -- PROOFS (safe subquery)
-        (
-          SELECT COALESCE(
-            JSON_ARRAYAGG(dp.image_url),
-            JSON_ARRAY()
-          )
-          FROM delivery_proofs dp
-          WHERE dp.delivery_id = d.id
+        COALESCE(
+          JSON_ARRAYAGG(DISTINCT dp.image_url),
+          JSON_ARRAY()
         ) AS proof_images
 
       FROM deliveries d
+      LEFT JOIN drivers dr ON dr.id = d.driver_id
+      LEFT JOIN users u ON u.id = dr.user_id
+      LEFT JOIN delivery_instructions di ON di.delivery_id = d.id
+      LEFT JOIN delivery_proofs dp ON dp.delivery_id = d.id
+
       WHERE d.store_id = ?
+      GROUP BY d.id
       ORDER BY d.created_at DESC
       `,
       [storeId]
     );
 
-    // Parse JSON safely
     for (const d of rows) {
       if (typeof d.driver === "string") d.driver = JSON.parse(d.driver);
       if (typeof d.delivery_instructions === "string")
@@ -569,90 +611,10 @@ app.get("/store/orders", requireAuth, async (req, res, next) => {
   }
 });
 
-// STORE ORDERS (LIST) — FIXED:
-// - keeps optimized query
-// - BUT returns JSON exactly like Flutter expects:
-//   driver: {id,name,phone}
-//   delivery_instructions: {buzz_code, unit, note}
-//   proof_images: []
 
-// GET ORDERS — ULTRA OPTIMIZED (single SQL query, no N+1)
-app.get("/store/orders", requireAuth, async (req, res, next) => {
-  try {
-    if (req.user.role !== "STORE")
-      return res.status(403).json({ message: "Forbidden" });
-
-    const storeId = await getStoreId(req.user.id);
-    if (!storeId) return res.status(400).json({ message: "Store not found" });
-
-    const [rows] = await db.query(
-      `
-      SELECT
-        d.*,
-
-        -- DRIVER
-        CASE
-          WHEN dr.id IS NULL THEN NULL
-          ELSE JSON_OBJECT(
-            'id', dr.id,
-            'name', u.name,
-            'phone', u.phone
-          )
-        END AS driver,
-
-        -- INSTRUCTIONS
-        CASE
-          WHEN di.delivery_id IS NULL THEN NULL
-          ELSE JSON_OBJECT(
-            'buzz_code', di.buzz_code,
-            'unit', di.unit,
-            'note', di.note
-          )
-        END AS delivery_instructions,
-
-        -- PROOFS
-        COALESCE(
-          JSON_ARRAYAGG(DISTINCT dp.image_url),
-          JSON_ARRAY()
-        ) AS proof_images
-
-      FROM deliveries d
-
-      LEFT JOIN drivers dr ON dr.id = d.driver_id
-      LEFT JOIN users u ON u.id = dr.user_id
-      LEFT JOIN delivery_instructions di ON di.delivery_id = d.id
-      LEFT JOIN delivery_proofs dp ON dp.delivery_id = d.id
-
-      WHERE d.store_id = ?
-      GROUP BY d.id
-      ORDER BY d.created_at DESC
-      `,
-      [storeId]
-    );
-
-    // Parse JSON safely for Node.js
-    for (const d of rows) {
-      if (typeof d.driver === "string") {
-        d.driver = JSON.parse(d.driver);
-      }
-
-      if (typeof d.delivery_instructions === "string") {
-        d.delivery_instructions = JSON.parse(d.delivery_instructions);
-      }
-
-      if (typeof d.proof_images === "string") {
-        d.proof_images = JSON.parse(d.proof_images);
-      }
-    }
-
-    res.json(rows);
-  } catch (err) {
-    next(err);
-  }
-});
-
-
-// STORE CREATE DELIVERY (FULL + GEO SAVE + PRICE SAVE)
+// ===============================
+// CREATE DELIVERY
+// ===============================
 app.post("/store/orders", requireAuth, async (req, res, next) => {
   try {
     if (req.user.role !== "STORE")
@@ -680,7 +642,7 @@ app.post("/store/orders", requireAuth, async (req, res, next) => {
     if (!storeId) return res.status(400).json({ message: "Store not found" });
 
     const pickup = await getStorePickup(storeId);
-    const drop = await geocodeAddress(dropoff_address, req.user.id);
+    const drop = await geocodeAddress(dropoff_address);
 
     const route = await getRouteDistanceAndEtaKm(
       pickup.pickup_lat,
@@ -760,7 +722,10 @@ app.post("/store/orders", requireAuth, async (req, res, next) => {
   }
 });
 
-// STORE UPDATE STATUS + NOTIFY DRIVERS — FINAL FLOW FIXED
+
+// ===============================
+// STORE UPDATE STATUS
+// ===============================
 app.put("/store/orders/:id/status", requireAuth, async (req, res, next) => {
   try {
     if (req.user.role !== "STORE")
@@ -770,13 +735,12 @@ app.put("/store/orders/:id/status", requireAuth, async (req, res, next) => {
     const storeId = await getStoreId(req.user.id);
 
     const [[delivery]] = await db.query(
-      "SELECT * FROM deliveries WHERE id = ? AND store_id = ?",
+      "SELECT * FROM deliveries WHERE id=? AND store_id=?",
       [req.params.id, storeId]
     );
 
     if (!delivery) return res.status(404).json({ message: "Not found" });
 
-    // FINAL FLOW: CREATED → READY_FOR_PICKUP (NO PREPARING)
     if (delivery.status === "CREATED" && status === "READY_FOR_PICKUP") {
       await db.query(
         "UPDATE deliveries SET status='READY_FOR_PICKUP' WHERE id=?",
@@ -786,10 +750,9 @@ app.put("/store/orders/:id/status", requireAuth, async (req, res, next) => {
       const [drivers] = await db.query(
         "SELECT u.id AS user_id FROM drivers d JOIN users u ON u.id = d.user_id"
       );
-      const driverUserIds = drivers.map((d) => d.user_id);
 
       await sendPushToUsers(
-        driverUserIds,
+        drivers.map((d) => d.user_id),
         "📦 New delivery available",
         "A store has a delivery ready for pickup",
         { deliveryId: delivery.id }
@@ -802,7 +765,10 @@ app.put("/store/orders/:id/status", requireAuth, async (req, res, next) => {
   }
 });
 
-// STORE DELETE DELIVERY
+
+// ===============================
+// DELETE DELIVERY
+// ===============================
 app.delete("/store/orders/:id", requireAuth, async (req, res, next) => {
   try {
     if (req.user.role !== "STORE")
@@ -815,6 +781,7 @@ app.delete("/store/orders/:id", requireAuth, async (req, res, next) => {
       "SELECT id, status FROM deliveries WHERE id=? AND store_id=?",
       [deliveryId, storeId]
     );
+
     if (!delivery) return res.status(404).json({ message: "Not found" });
 
     if (["ACCEPTED", "PICKED_UP", "DELIVERED"].includes(delivery.status)) {
@@ -823,22 +790,16 @@ app.delete("/store/orders/:id", requireAuth, async (req, res, next) => {
         .json({ message: "Cannot delete after driver accepted" });
     }
 
-    await db.query("DELETE FROM delivery_proofs WHERE delivery_id=?", [
-      deliveryId,
-    ]);
-    await db.query("DELETE FROM delivery_instructions WHERE delivery_id=?", [
-      deliveryId,
-    ]);
-    await db.query("DELETE FROM deliveries WHERE id=? AND store_id=?", [
-      deliveryId,
-      storeId,
-    ]);
+    await db.query("DELETE FROM delivery_proofs WHERE delivery_id=?", [deliveryId]);
+    await db.query("DELETE FROM delivery_instructions WHERE delivery_id=?", [deliveryId]);
+    await db.query("DELETE FROM deliveries WHERE id=? AND store_id=?", [deliveryId, storeId]);
 
     res.json({ success: true });
   } catch (err) {
     next(err);
   }
 });
+
 
 // =======================================================
 // DRIVER
