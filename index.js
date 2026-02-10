@@ -562,10 +562,66 @@ app.get("/store/orders", requireAuth, async (req, res, next) => {
     if (!storeId) return res.status(400).json({ message: "Store not found" });
 
     // 1) Get deliveries
-    const [deliveries] = await db.query(
-      `SELECT * FROM deliveries WHERE store_id = ? ORDER BY created_at DESC`,
-      [storeId]
-    );
+  const [deliveries] = await db.query(`
+  SELECT
+    d.*,
+
+    -- driver info
+    (
+      SELECT JSON_OBJECT(
+        'id', dr.id,
+        'name', u.name,
+        'phone', u.phone
+      )
+      FROM drivers dr
+      JOIN users u ON u.id = dr.user_id
+      WHERE dr.id = d.driver_id
+      LIMIT 1
+    ) AS driver,
+
+    -- instructions
+    (
+      SELECT JSON_OBJECT(
+        'buzz_code', di.buzz_code,
+        'unit', di.unit,
+        'note', di.note
+      )
+      FROM delivery_instructions di
+      WHERE di.delivery_id = d.id
+      LIMIT 1
+    ) AS delivery_instructions,
+
+    -- proof images
+    (
+      SELECT JSON_ARRAYAGG(dp.image_url)
+      FROM delivery_proofs dp
+      WHERE dp.delivery_id = d.id
+    ) AS proof_images
+
+  FROM deliveries d
+  WHERE d.store_id = ?
+  ORDER BY d.created_at DESC
+`, [storeId]);
+for (const d of deliveries) {
+  if (typeof d.driver === "string") {
+    d.driver = JSON.parse(d.driver);
+  } else if (!d.driver) {
+    d.driver = null;
+  }
+
+  if (typeof d.delivery_instructions === "string") {
+    d.delivery_instructions = JSON.parse(d.delivery_instructions);
+  } else if (!d.delivery_instructions) {
+    d.delivery_instructions = null;
+  }
+
+  if (typeof d.proof_images === "string") {
+    d.proof_images = JSON.parse(d.proof_images);
+  } else if (!Array.isArray(d.proof_images)) {
+    d.proof_images = [];
+  }
+}
+
 
     // 2) Attach extra data safely
     for (const d of deliveries) {
