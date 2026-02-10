@@ -559,35 +559,34 @@ app.get("/store/orders", requireAuth, async (req, res, next) => {
     const storeId = await getStoreId(req.user.id);
     if (!storeId) return res.status(400).json({ message: "Store not found" });
 
-    const [rows] = await db.query(
-      `
-      SELECT
-        d.*,
+   const [rows] = await db.query(`
+  SELECT
+    d.*,
 
-        -- Driver info (aliased so we can build driver object)
-        dr.id AS driver_id,
-        u.name AS driver_name,
-        u.phone AS driver_phone,
+    -- Driver info
+    dr.id AS driver_id,
+    u.name AS driver_name,
+    u.phone AS driver_phone,
 
-        -- Instructions (aliased)
-        di.buzz_code AS instr_buzz_code,
-        di.unit AS instr_unit,
-        di.note AS instr_note,
+    -- Instructions
+    di.buzz_code,
+    di.unit,
+    di.note,
 
-        -- Proof images aggregated
-        GROUP_CONCAT(dp.image_url ORDER BY dp.created_at SEPARATOR '||') AS proof_images_concat
+    -- Proof images aggregated
+    GROUP_CONCAT(dp.image_url ORDER BY dp.created_at SEPARATOR '||') AS proof_images
 
-      FROM deliveries d
-      LEFT JOIN drivers dr ON dr.id = d.driver_id
-      LEFT JOIN users u ON u.id = dr.user_id
-      LEFT JOIN delivery_instructions di ON di.delivery_id = d.id
-      LEFT JOIN delivery_proofs dp ON dp.delivery_id = d.id
-      WHERE d.store_id = ?
-      GROUP BY d.id
-      ORDER BY d.created_at DESC
-      `,
-      [storeId]
-    );
+  FROM deliveries d
+
+  LEFT JOIN drivers dr ON dr.id = d.driver_id
+  LEFT JOIN users u ON u.id = dr.user_id
+  LEFT JOIN delivery_instructions di ON di.delivery_id = d.id
+  LEFT JOIN delivery_proofs dp ON dp.delivery_id = d.id
+
+  WHERE d.store_id = ?
+  GROUP BY d.id
+  ORDER BY d.created_at DESC
+`, [storeId]);
 
     const deliveries = rows.map((r) => {
       // Build proof_images as array
