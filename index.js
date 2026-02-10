@@ -552,7 +552,7 @@ app.post("/store/orders/preview", requireAuth, async (req, res, next) => {
 //   delivery_instructions: {buzz_code, unit, note}
 //   proof_images: []
 
-//GET ORDERS
+// GET ORDERS — ULTRA OPTIMIZED (single SQL query, no N+1)
 app.get("/store/orders", requireAuth, async (req, res, next) => {
   try {
     if (req.user.role !== "STORE")
@@ -561,100 +561,67 @@ app.get("/store/orders", requireAuth, async (req, res, next) => {
     const storeId = await getStoreId(req.user.id);
     if (!storeId) return res.status(400).json({ message: "Store not found" });
 
-    // 1) Get deliveries
-  const [deliveries] = await db.query(`
-  SELECT
-    d.*,
+    const [rows] = await db.query(
+      `
+      SELECT
+        d.*,
 
-    -- driver info
-    (
-      SELECT JSON_OBJECT(
-        'id', dr.id,
-        'name', u.name,
-        'phone', u.phone
-      )
-      FROM drivers dr
-      JOIN users u ON u.id = dr.user_id
-      WHERE dr.id = d.driver_id
-      LIMIT 1
-    ) AS driver,
+        -- DRIVER
+        CASE
+          WHEN dr.id IS NULL THEN NULL
+          ELSE JSON_OBJECT(
+            'id', dr.id,
+            'name', u.name,
+            'phone', u.phone
+          )
+        END AS driver,
 
-    -- instructions
-    (
-      SELECT JSON_OBJECT(
-        'buzz_code', di.buzz_code,
-        'unit', di.unit,
-        'note', di.note
-      )
-      FROM delivery_instructions di
-      WHERE di.delivery_id = d.id
-      LIMIT 1
-    ) AS delivery_instructions,
+        -- INSTRUCTIONS
+        CASE
+          WHEN di.delivery_id IS NULL THEN NULL
+          ELSE JSON_OBJECT(
+            'buzz_code', di.buzz_code,
+            'unit', di.unit,
+            'note', di.note
+          )
+        END AS delivery_instructions,
 
-    -- proof images
-    (
-      SELECT JSON_ARRAYAGG(dp.image_url)
-      FROM delivery_proofs dp
-      WHERE dp.delivery_id = d.id
-    ) AS proof_images
+        -- PROOFS
+        COALESCE(
+          JSON_ARRAYAGG(DISTINCT dp.image_url),
+          JSON_ARRAY()
+        ) AS proof_images
 
-  FROM deliveries d
-  WHERE d.store_id = ?
-  ORDER BY d.created_at DESC
-`, [storeId]);
-for (const d of deliveries) {
-  if (typeof d.driver === "string") {
-    d.driver = JSON.parse(d.driver);
-  } else if (!d.driver) {
-    d.driver = null;
-  }
+      FROM deliveries d
 
-  if (typeof d.delivery_instructions === "string") {
-    d.delivery_instructions = JSON.parse(d.delivery_instructions);
-  } else if (!d.delivery_instructions) {
-    d.delivery_instructions = null;
-  }
+      LEFT JOIN drivers dr ON dr.id = d.driver_id
+      LEFT JOIN users u ON u.id = dr.user_id
+      LEFT JOIN delivery_instructions di ON di.delivery_id = d.id
+      LEFT JOIN delivery_proofs dp ON dp.delivery_id = d.id
 
-  if (typeof d.proof_images === "string") {
-    d.proof_images = JSON.parse(d.proof_images);
-  } else if (!Array.isArray(d.proof_images)) {
-    d.proof_images = [];
-  }
-}
+      WHERE d.store_id = ?
+      GROUP BY d.id
+      ORDER BY d.created_at DESC
+      `,
+      [storeId]
+    );
 
+    // Parse JSON safely for Node.js
+    for (const d of rows) {
+      if (typeof d.driver === "string") {
+        d.driver = JSON.parse(d.driver);
+      }
 
-    // 2) Attach extra data safely
-    for (const d of deliveries) {
-      // proofs
-      const [proofs] = await db.query(
-        "SELECT image_url FROM delivery_proofs WHERE delivery_id = ? ORDER BY created_at ASC",
-        [d.id]
-      );
-      d.proof_images = proofs.map((p) => p.image_url);
+      if (typeof d.delivery_instructions === "string") {
+        d.delivery_instructions = JSON.parse(d.delivery_instructions);
+      }
 
-      // instructions
-      const [inst] = await db.query(
-        "SELECT buzz_code, unit, note FROM delivery_instructions WHERE delivery_id = ? LIMIT 1",
-        [d.id]
-      );
-      d.delivery_instructions = inst[0] ?? null;
-
-      // driver
-      if (d.driver_id) {
-        const [rows] = await db.query(
-          `SELECT dr.id, u.name, u.phone
-           FROM drivers dr
-           JOIN users u ON u.id = dr.user_id
-           WHERE dr.id = ?`,
-          [d.driver_id]
-        );
-        d.driver = rows[0] ?? null;
-      } else {
-        d.driver = null;
+      if (typeof d.proof_images === "string") {
+        d.proof_images = JSON.parse(d.proof_images);
       }
     }
 
-    res.json(deliveries);
+    res.json(rows);
   } catch (err) {
     next(err);
   }
