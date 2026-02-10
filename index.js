@@ -498,48 +498,72 @@ app.post("/me/device", requireAuth, async (req, res, next) => {
 // =======================================================
 
 // PREVIEW (distance + ETA + PRICE) before creating order
-app.post("/store/orders/preview", requireAuth, async (req, res, next) => {
+// GET ORDERS — FAST + SAFE + NO DATA LOSS
+app.get("/store/orders", requireAuth, async (req, res, next) => {
   try {
     if (req.user.role !== "STORE")
       return res.status(403).json({ message: "Forbidden" });
 
-    const { dropoff_address, deliver_before = null, deliver_after = null } =
-      req.body || {};
-
-    if (!dropoff_address) {
-      return res.status(400).json({ message: "dropoff_address required" });
-    }
-
     const storeId = await getStoreId(req.user.id);
     if (!storeId) return res.status(400).json({ message: "Store not found" });
 
-    const pickup = await getStorePickup(storeId);
-    const drop = await geocodeAddress(dropoff_address, req.user.id);
+    const [rows] = await db.query(
+      `
+      SELECT
+        d.*,
 
-    const route = await getRouteDistanceAndEtaKm(
-      pickup.pickup_lat,
-      pickup.pickup_lng,
-      drop.lat,
-      drop.lng
+        -- DRIVER (safe subquery)
+        (
+          SELECT JSON_OBJECT(
+            'id', dr.id,
+            'name', u.name,
+            'phone', u.phone
+          )
+          FROM drivers dr
+          JOIN users u ON u.id = dr.user_id
+          WHERE dr.id = d.driver_id
+          LIMIT 1
+        ) AS driver,
+
+        -- INSTRUCTIONS (safe subquery)
+        (
+          SELECT JSON_OBJECT(
+            'buzz_code', di.buzz_code,
+            'unit', di.unit,
+            'note', di.note
+          )
+          FROM delivery_instructions di
+          WHERE di.delivery_id = d.id
+          LIMIT 1
+        ) AS delivery_instructions,
+
+        -- PROOFS (safe subquery)
+        (
+          SELECT COALESCE(
+            JSON_ARRAYAGG(dp.image_url),
+            JSON_ARRAY()
+          )
+          FROM delivery_proofs dp
+          WHERE dp.delivery_id = d.id
+        ) AS proof_images
+
+      FROM deliveries d
+      WHERE d.store_id = ?
+      ORDER BY d.created_at DESC
+      `,
+      [storeId]
     );
 
-    const pricing = calculatePrice(
-      route.distanceKm,
-      deliver_before,
-      deliver_after
-    );
+    // Parse JSON safely
+    for (const d of rows) {
+      if (typeof d.driver === "string") d.driver = JSON.parse(d.driver);
+      if (typeof d.delivery_instructions === "string")
+        d.delivery_instructions = JSON.parse(d.delivery_instructions);
+      if (typeof d.proof_images === "string")
+        d.proof_images = JSON.parse(d.proof_images);
+    }
 
-    res.json({
-      distance_km: Number(route.distanceKm.toFixed(2)),
-      eta_minutes: route.etaMinutes,
-      ...pricing,
-
-      pickup_address: pickup.pickup_address,
-      pickup_lat: pickup.pickup_lat,
-      pickup_lng: pickup.pickup_lng,
-      dropoff_lat: drop.lat,
-      dropoff_lng: drop.lng,
-    });
+    res.json(rows);
   } catch (err) {
     next(err);
   }
