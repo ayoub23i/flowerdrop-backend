@@ -551,6 +551,8 @@ app.post("/store/orders/preview", requireAuth, async (req, res, next) => {
 //   driver: {id,name,phone}
 //   delivery_instructions: {buzz_code, unit, note}
 //   proof_images: []
+
+//GET ORDERS
 app.get("/store/orders", requireAuth, async (req, res, next) => {
   try {
     if (req.user.role !== "STORE")
@@ -559,85 +561,49 @@ app.get("/store/orders", requireAuth, async (req, res, next) => {
     const storeId = await getStoreId(req.user.id);
     if (!storeId) return res.status(400).json({ message: "Store not found" });
 
-   const [rows] = await db.query(`
-  SELECT
-    d.*,
+    // 1) Get deliveries
+    const [deliveries] = await db.query(
+      `SELECT * FROM deliveries WHERE store_id = ? ORDER BY created_at DESC`,
+      [storeId]
+    );
 
-    -- Driver info
-    dr.id AS driver_id,
-    u.name AS driver_name,
-    u.phone AS driver_phone,
+    // 2) Attach extra data safely
+    for (const d of deliveries) {
+      // proofs
+      const [proofs] = await db.query(
+        "SELECT image_url FROM delivery_proofs WHERE delivery_id = ? ORDER BY created_at ASC",
+        [d.id]
+      );
+      d.proof_images = proofs.map((p) => p.image_url);
 
-    -- Instructions
-    di.buzz_code,
-    di.unit,
-    di.note,
+      // instructions
+      const [inst] = await db.query(
+        "SELECT buzz_code, unit, note FROM delivery_instructions WHERE delivery_id = ? LIMIT 1",
+        [d.id]
+      );
+      d.delivery_instructions = inst[0] ?? null;
 
-    -- Proof images aggregated
-    GROUP_CONCAT(dp.image_url ORDER BY dp.created_at SEPARATOR '||') AS proof_images
-
-  FROM deliveries d
-
-  LEFT JOIN drivers dr ON dr.id = d.driver_id
-  LEFT JOIN users u ON u.id = dr.user_id
-  LEFT JOIN delivery_instructions di ON di.delivery_id = d.id
-  LEFT JOIN delivery_proofs dp ON dp.delivery_id = d.id
-
-  WHERE d.store_id = ?
-  GROUP BY d.id
-  ORDER BY d.created_at DESC
-`, [storeId]);
-
-    const deliveries = rows.map((r) => {
-      // Build proof_images as array
-      const proof_images = r.proof_images_concat
-        ? String(r.proof_images_concat).split("||").filter(Boolean)
-        : [];
-
-      // Build delivery_instructions EXACT keys Flutter expects
-      const hasInstr = r.instr_buzz_code || r.instr_unit || r.instr_note;
-      const delivery_instructions = hasInstr
-        ? {
-            buzz_code: r.instr_buzz_code,
-            unit: r.instr_unit,
-            note: r.instr_note,
-          }
-        : null;
-
-      // Build driver object
-      const driver = r.driver_id
-        ? {
-            id: r.driver_id,
-            name: r.driver_name,
-            phone: r.driver_phone,
-          }
-        : null;
-
-      // Remove helper fields so Flutter doesn't get weird types
-      const {
-        proof_images_concat,
-        instr_buzz_code,
-        instr_unit,
-        instr_note,
-        driver_id,
-        driver_name,
-        driver_phone,
-        ...clean
-      } = r;
-
-      return {
-        ...clean,
-        proof_images,
-        delivery_instructions,
-        driver,
-      };
-    });
+      // driver
+      if (d.driver_id) {
+        const [rows] = await db.query(
+          `SELECT dr.id, u.name, u.phone
+           FROM drivers dr
+           JOIN users u ON u.id = dr.user_id
+           WHERE dr.id = ?`,
+          [d.driver_id]
+        );
+        d.driver = rows[0] ?? null;
+      } else {
+        d.driver = null;
+      }
+    }
 
     res.json(deliveries);
   } catch (err) {
     next(err);
   }
 });
+
 
 // STORE CREATE DELIVERY (FULL + GEO SAVE + PRICE SAVE)
 app.post("/store/orders", requireAuth, async (req, res, next) => {
